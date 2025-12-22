@@ -45,22 +45,24 @@ def main(args):
         )
     robot.post_scene_build_setup()
     robot.reset_idx() 
-    step = 0 
-    max_step = 200
-    iters = 0
-    rand_actions = np.random.randn(max_step, robot.action_dim)
-    rand_actions = torch.tensor(rand_actions, dtype=torch.float32, device=device)
-    while True:
-        robot.step(rand_actions[step].repeat(num_envs, 1))
-        _ = robot.get_observations()
-        step += 1
-        scene.step()
-        if step >= max_step:
-            robot.reset_idx()
-            # scene.reset() 
-            step = 0
-            iters += 1 
-            exit()
+    
+    # Debug: print init_qpos to verify default_qpos is loaded
+    print("\n=== DEBUG: robot.init_qpos (first 6 = forearm joints) ===")
+    forearm_labels = ['tx', 'ty', 'tz', 'roll', 'pitch', 'yaw']
+    for i, label in enumerate(forearm_labels):
+        print(f"  {label}: {robot.init_qpos[0, i].item():.4f}")
+    
+    # IMPORTANT: Need to step the scene for physics to update positions!
+    scene.step()
+    
+    # Now check actual joint positions after stepping
+    print("\n=== DEBUG: Actual joint positions after scene.step() ===")
+    actual_pos = robot.entity.get_dofs_position()[0]
+    for i, label in enumerate(forearm_labels):
+        print(f"  {label}: {actual_pos[i].item():.4f}")
+    
+    print("\nHand should now be at the correct position. Use breakpoint to inspect.")
+    breakpoint()
     return 
 
 

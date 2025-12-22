@@ -87,8 +87,19 @@ def load_genesis_retarget_data(
         data = torch.load(data_fname)
         loaded_tensor = True 
 
-    demo_data = data["demo_data"] 
-    demo_data = {k: v[frame_start:frame_end] for k, v in demo_data.items()}
+    demo_data = data["demo_data"]
+    expected_length = frame_end - frame_start
+    
+    # Check if data is already pre-sliced (common for .pt files from parallel_retarget.py)
+    first_val = next(iter(demo_data.values()))
+    data_length = first_val.shape[0] if hasattr(first_val, 'shape') else len(first_val)
+    already_sliced = (data_length == expected_length)
+    
+    if already_sliced:
+        # Data is already sliced to correct range, don't slice again
+        demo_data = {k: v for k, v in demo_data.items()}
+    else:
+        demo_data = {k: v[frame_start:frame_end] for k, v in demo_data.items()}
     if len(demo_data['obj_arti'].shape) > 1:
         demo_data['obj_arti'] = demo_data['obj_arti'][:, 0] # shape (num_frames,)
 
@@ -97,27 +108,40 @@ def load_genesis_retarget_data(
     for side in ['left', 'right']:
         loaded = retarget_loaded[side]
         residual_qpos = loaded["joint_qpos"]
-        sliced_qpos = {k: v[frame_start:frame_end] for k, v in residual_qpos.items()}
+        if already_sliced:
+            sliced_qpos = {k: v for k, v in residual_qpos.items()}
+        else:
+            sliced_qpos = {k: v[frame_start:frame_end] for k, v in residual_qpos.items()}
         
         qpos_targets = None 
         if 'joint_targets' in loaded:
             print("Using joint_targets")
             qpos_targets = loaded["joint_targets"]
-            qpos_targets = {k: v[frame_start:frame_end] for k, v in qpos_targets.items()}
+            if already_sliced:
+                qpos_targets = {k: v for k, v in qpos_targets.items()}
+            else:
+                qpos_targets = {k: v[frame_start:frame_end] for k, v in qpos_targets.items()}
         limits, init_pos = get_joint_init_limits(sliced_qpos) # this is a dict 
         kpt_pos = loaded["kpt_pos"]
         if len(kpt_pos.shape) > 3:
             print("Omitting the first dimension of kpt_pos")
             kpt_pos = kpt_pos[0]
-        kpt_info = dict(
-            kpt_pos=kpt_pos[frame_start:frame_end],
-            kpt_names=loaded["kpt_names"],
-        )
+        if already_sliced:
+            kpt_info = dict(
+                kpt_pos=kpt_pos,
+                kpt_names=loaded["kpt_names"],
+            )
+        else:
+            kpt_info = dict(
+                kpt_pos=kpt_pos[frame_start:frame_end],
+                kpt_names=loaded["kpt_names"],
+            )
         wrist_pose = loaded[f"wrist_pose"]
         if len(wrist_pose.shape) > 2:
             print("Omitting the first dimension of wrist_pose")
             wrist_pose = wrist_pose[0]
-        wrist_pose = wrist_pose[frame_start:frame_end]
+        if not already_sliced:
+            wrist_pose = wrist_pose[frame_start:frame_end]
         num_frames = wrist_pose.shape[0]
         retarget_data[side] = dict(
             init_qpos=init_pos, 
@@ -143,6 +167,13 @@ def load_contact_retarget_data(
     fname = f"{RETARGET_CONTACT_DIR}/{hand_name}/{subject_name}/{obj_name}_use_{use_clip}.npy"
     assert os.path.exists(fname), f"File {fname} not found"
     loaded = np.load(fname, allow_pickle=True).item()
+    
+    # Check if data is already pre-sliced
+    expected_length = frame_end - frame_start
+    first_side_data = loaded['left']['dexlink_contacts']
+    data_length = first_side_data.shape[0]
+    already_sliced = (data_length == expected_length)
+    
     retar_contact = dict()
     for side in ['left', 'right']:
         data = loaded[side] 
@@ -150,7 +181,10 @@ def load_contact_retarget_data(
             ["dexlink_contacts", "dexlink_valid_contacts"],
             [f"contact_links_{side}", f"contact_links_valid_{side}"]
         ):
-            retar_contact[target_key] = data[source_key][frame_start:frame_end]
+            if already_sliced:
+                retar_contact[target_key] = data[source_key]
+            else:
+                retar_contact[target_key] = data[source_key][frame_start:frame_end]
         retar_contact[side] = {key: data[key] for key in ["collision_link_names", "collision_link_local_idxs"]}
         
     return retar_contact

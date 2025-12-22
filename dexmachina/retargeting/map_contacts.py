@@ -443,6 +443,10 @@ if __name__ == "__main__":
             # set_entities_to_step(hand_entities, retargeter_results, step)
             # set_object_to_step(obj, obj_states, step)
         scene.step()
+        # Print frame info with articulation angle
+        obj_arti = obj_states["joint_qpos"][step] if args.show_object else 0
+        print(f"Frame {step:4d}/{num_steps} | Lid angle: {obj_arti:.3f} rad ({np.degrees(obj_arti):.1f}°)", end='\r')
+        
         if args.record_video and not saved_vid:
             if args.raytrace:
                 # render segmentation 

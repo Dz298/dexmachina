@@ -275,8 +275,7 @@ def main(args):
             
         step += 1
         if step == max_steps:
-            step = 0
-            # breakpoint()
+            break
         if step % 10 == 0:
             print(f"Step {step}/{max_steps}") 
             for side in ['right', 'left']:
