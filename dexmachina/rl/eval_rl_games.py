@@ -79,9 +79,9 @@ def eval_one_episode(env, agent, obj_state_tensor, print_rew=False, record_video
                     
             if show_reference: # visualize the demo traj and set zero action
                 obj.set_object_state(
-                    root_pos=state[:, :3][None],
-                    root_quat=state[:, 3:7][None],
-                    joint_qpos=state[:, 7][None],
+                    root_pos=demo_state[:3][None],
+                    root_quat=demo_state[3:7][None],
+                    joint_qpos=demo_state[7][None],
                     env_idxs=torch.tensor([1], dtype=torch.int32, device=device),
                 )
                 actions[-1, :] = -1.0 
