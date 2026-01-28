@@ -38,6 +38,7 @@ def get_reward_cfg(last_n_frame=-1):
         "multiply_frame_contact": True,
         "mask_zero_contact": True, # if both policy and demo has no contact, reward is 0 (1 if False)
         "contact_phase_penalty": 0,
+        "thumb_weight": 1.0,  # Weight multiplier for thumb contact (>1 means thumb is more important)
 
         "mask_well_track": False, 
         "scale_well_track": 1.0,
@@ -96,6 +97,9 @@ class RewardModule:
         self.multiply_frame_contact = reward_cfg.get("multiply_frame_contact", True) 
         self.mask_zero_contact = reward_cfg.get("mask_zero_contact", True)
         self.contact_rew_function = reward_cfg.get("contact_rew_function", "exp")
+        self.thumb_weight = reward_cfg.get("thumb_weight", 1.0)
+        if self.thumb_weight != 1.0:
+            print(f"Using thumb weight: {self.thumb_weight}x")
         self.load_demo(demo_data, retarget_data, device) 
 
     def load_demo(self, demo_data, retarget_data, device):
@@ -127,6 +131,22 @@ class RewardModule:
                     self.demo_tensors[key] = torch.tensor(
                         retarget_data[side]['wrist_pose'], dtype=torch.float32, device=device
                     )
+        
+        # Load collision link names and create thumb weight tensors
+        # Note: collision_link_names is stored in demo_data[side], not retarget_data
+        self.contact_link_weights = {}
+        if self.contact_rew_weight > 0.0 and self.thumb_weight != 1.0:
+            for side in ['left', 'right']:
+                if side in demo_data and 'collision_link_names' in demo_data[side]:
+                    link_names = demo_data[side]['collision_link_names']
+                    # Create weight tensor: thumb links get thumb_weight, others get 1.0
+                    weights = []
+                    for name in link_names:
+                        is_thumb = 'thumb' in name.lower()
+                        weights.append(self.thumb_weight if is_thumb else 1.0)
+                    self.contact_link_weights[side] = torch.tensor(weights, dtype=torch.float32, device=device)
+                    thumb_count = sum(1 for n in link_names if 'thumb' in n.lower())
+                    print(f"Contact link weights ({side}): {thumb_count} thumb links with {self.thumb_weight}x weight")
         
         # check all the data have the same first dim size 
         assert all(
@@ -456,18 +476,48 @@ class RewardModule:
                 contacts, valids, episode_length_buf, 
                 obj_pose, demo_obj_pose, side=side
             )
+            # Get link weights (thumb-weighted if enabled)
+            link_weights = self.contact_link_weights.get(side, None)
+            
             for i, part in enumerate(['bottom', 'top']): 
-                con_dist = part_dist[:, i]
+                con_dist = part_dist[:, i]  # shape (N, num_links)
                 if self.exp_kpt_first:
-                    con_rew = self.contact_dist_to_rew(con_dist, self.contact_rew_function).mean(dim=-1) 
+                    per_link_rew = self.contact_dist_to_rew(con_dist, self.contact_rew_function)  # (N, num_links)
+                    # Use weighted mean if weights are available
+                    if link_weights is not None:
+                        # Weighted mean: sum(w * x) / sum(w)
+                        con_rew = (per_link_rew * link_weights).sum(dim=-1) / link_weights.sum()
+                        # Log thumb vs other finger rewards separately
+                        thumb_mask = link_weights > 1.0  # thumb links have weight > 1
+                        if thumb_mask.any():
+                            thumb_rew = per_link_rew[:, thumb_mask].mean(dim=-1)
+                            other_rew = per_link_rew[:, ~thumb_mask].mean(dim=-1)
+                            rews[f"thumb_conrew_{side}_{part}"] = thumb_rew
+                            rews[f"other_conrew_{side}_{part}"] = other_rew
+                    else:
+                        con_rew = per_link_rew.mean(dim=-1)
                 else:
-                    con_rew = self.contact_dist_to_rew(con_dist.mean(dim=-1), self.contact_rew_function) 
+                    # For non-exp_kpt_first, apply weights to distances before mean
+                    if link_weights is not None:
+                        weighted_dist = (con_dist * link_weights).sum(dim=-1) / link_weights.sum()
+                        con_rew = self.contact_dist_to_rew(weighted_dist, self.contact_rew_function)
+                    else:
+                        con_rew = self.contact_dist_to_rew(con_dist.mean(dim=-1), self.contact_rew_function) 
                 rews[f"conrew_{side}_{part}"] = con_rew
                 rews[f"matched_condist_{side}_{part}"] = con_dist
                 contact_rew += con_rew
         contact_rew /= 4.0
         contact_rew *= self.contact_rew_weight
         rews['con_rew'] = contact_rew
+        
+        # Aggregate thumb vs other reward for easier WandB tracking
+        if self.thumb_weight != 1.0:
+            thumb_rews = [v for k, v in rews.items() if k.startswith('thumb_conrew')]
+            other_rews = [v for k, v in rews.items() if k.startswith('other_conrew')]
+            if thumb_rews:
+                rews['thumb_con_rew'] = torch.stack(thumb_rews).mean(dim=0)
+                rews['other_con_rew'] = torch.stack(other_rews).mean(dim=0)
+        
         return contact_rew, rews
 
 

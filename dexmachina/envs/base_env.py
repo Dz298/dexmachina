@@ -134,6 +134,8 @@ def get_env_cfg(
         "max_video_frames": 0,
         "observe_tip_dist": False,
         "observe_contact_force": False,
+        "observe_hand_demo_diff": False,
+        "traj_lookahead_frames": 0,
         "use_contact_reward": False,
         'use_rl_games': True,
         "is_eval": False, 
@@ -378,6 +380,33 @@ class BaseEnv:
         if self.n_objects == 0:
             self.observe_contact_force = False
             print("Disabling contact force observation because no object")
+        
+        # Hand demo diff observation: measures deviation from demo trajectory
+        self.observe_hand_demo_diff = env_cfg.get('observe_hand_demo_diff', False)
+        if self.observe_hand_demo_diff:
+            # Check that robots have residual_qpos set (demo trajectory)
+            has_demo = all(robot.residual_qpos is not None for robot in self.robots.values())
+            if not has_demo:
+                print("Warning: observe_hand_demo_diff requires residual_qpos, disabling")
+                self.observe_hand_demo_diff = False
+            else:
+                self.hand_demo_diff_dim = sum(robot.ndof for robot in self.robots.values())
+                print(f"Enabling hand demo diff observation, dim={self.hand_demo_diff_dim}")
+        
+        # Trajectory lookahead observation: future K frames of demo trajectory
+        self.traj_lookahead_frames = env_cfg.get('traj_lookahead_frames', 0)
+        if self.traj_lookahead_frames > 0:
+            has_demo = all(robot.residual_qpos is not None for robot in self.robots.values())
+            if not has_demo:
+                print("Warning: traj_lookahead requires residual_qpos, disabling")
+                self.traj_lookahead_frames = 0
+            else:
+                # For each future frame, we observe the delta from current demo qpos
+                # This gives relative motion rather than absolute positions
+                ndof_total = sum(robot.ndof for robot in self.robots.values())
+                self.traj_lookahead_dim = self.traj_lookahead_frames * ndof_total
+                print(f"Enabling traj lookahead observation, K={self.traj_lookahead_frames}, dim={self.traj_lookahead_dim}")
+        
         self.use_contact_reward = env_cfg.get('use_contact_reward', False) 
         if self.observe_contact_force or self.use_contact_reward:
             self.num_obj_links = len(self.object.coll_idxs_global)
@@ -474,6 +503,12 @@ class BaseEnv:
         
         if self.observe_contact_force:
             obs_dim += self.num_obj_links * self.num_robot_links * 1 # 3 for force vec
+
+        if self.observe_hand_demo_diff:
+            obs_dim += self.hand_demo_diff_dim
+
+        if self.traj_lookahead_frames > 0:
+            obs_dim += self.traj_lookahead_dim
 
         obs_idxs['episode_length'] = (obs_dim, obs_dim + 1) 
         ep_len_dim = 1 #* 10
@@ -855,6 +890,36 @@ class BaseEnv:
         if self.observe_contact_force:
             force_norm = torch.norm(self.contact_forces, dim=-1) * 0.01 # scale down! max contact force can go to 1000+
             value_list.append(force_norm.flatten(start_dim=1))
+
+        if self.observe_hand_demo_diff:
+            # Compute hand deviation from demo trajectory: demo_qpos - curr_qpos
+            # This tells the policy "how far am I from where I should be"
+            hand_demo_diffs = []
+            for name, robot in self.robots.items():
+                # curr_res_qpos is the demo qpos at current timestep (already computed in translate_actions)
+                # dof_pos is the actual current joint positions
+                demo_diff = robot.curr_res_qpos - robot.dof_pos  # shape (num_envs, ndof)
+                hand_demo_diffs.append(demo_diff)
+            value_list.append(torch.cat(hand_demo_diffs, dim=-1))
+
+        if self.traj_lookahead_frames > 0:
+            # Compute trajectory lookahead: future K frames of demo trajectory (as deltas from current)
+            # This tells the policy "where should I be going next"
+            lookahead_list = []
+            for k in range(1, self.traj_lookahead_frames + 1):
+                future_qpos_list = []
+                for name, robot in self.robots.items():
+                    # Compute future timestep, clamped to max frames
+                    future_t = torch.clamp(
+                        self.episode_length_buf + k,
+                        max=robot.residual_num_frames - 1
+                    )
+                    future_qpos = robot.residual_qpos[future_t]  # shape (num_envs, ndof)
+                    # Express as delta from current demo qpos (relative motion)
+                    future_delta = future_qpos - robot.curr_res_qpos  # shape (num_envs, ndof)
+                    future_qpos_list.append(future_delta)
+                lookahead_list.append(torch.cat(future_qpos_list, dim=-1))
+            value_list.append(torch.cat(lookahead_list, dim=-1))
 
         obs = torch.cat(value_list, dim=-1)
         self.obs_dict = all_obs_dict

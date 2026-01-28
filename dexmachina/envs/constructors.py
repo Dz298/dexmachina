@@ -35,6 +35,7 @@ def get_all_env_cfg(args, device, load_retarget_data=True):
     reward_cfg['contact_beta'] = args.contact_beta
     reward_cfg['wrist_frame_contact'] = not args.skip_wrist_frame_contact
     reward_cfg['mask_zero_contact'] = not args.nomask_zero_contact
+    reward_cfg['thumb_weight'] = args.thumb_weight
     reward_cfg['use_retarget_contact'] = args.use_retarget_contact 
     reward_cfg['retarget_objframe'] = not args.retarget_worldfr
     reward_cfg['action_penalty'] = args.action_penalty
@@ -106,6 +107,12 @@ def get_all_env_cfg(args, device, load_retarget_data=True):
     env_cfg['observe_tip_dist'] = args.observe_tip_dist
     env_cfg['observe_contact_force'] = True #ve_contact_force
     print(f"Setting observe_contact_force to True")
+    env_cfg['observe_hand_demo_diff'] = args.observe_hand_demo_diff
+    if args.observe_hand_demo_diff:
+        print(f"Setting observe_hand_demo_diff to True")
+    env_cfg['traj_lookahead_frames'] = args.observe_traj_lookahead
+    if args.observe_traj_lookahead > 0:
+        print(f"Setting traj_lookahead_frames to {args.observe_traj_lookahead}")
     env_cfg['use_contact_reward'] = args.contact_rew_weight > 0
     env_cfg['use_rl_games'] = args.use_rl_games
     env_cfg['rand_init_ratio'] = args.rand_init_ratio  
@@ -269,6 +276,8 @@ def get_common_argparser():
     parser.add_argument('--teleop_fname', type=str, default='data/scripted/tmp_box/tmp_box.npz')
     parser.add_argument('--observe_tip_dist', '-obt', action='store_true')
     parser.add_argument('--observe_contact_force', '-obf', action='store_true')
+    parser.add_argument('--observe_hand_demo_diff', '-ohdd', action='store_true', help='Observe hand deviation from demo trajectory')
+    parser.add_argument('--observe_traj_lookahead', '-otl', type=int, default=0, help='Number of future frames to observe from demo trajectory (0=disabled)')
     parser.add_argument('--task_rew_betas', '-trb', type=float, nargs='+', default=[10, 1, 5]) 
 
     parser.add_argument('--no_object', '-no_obj', action='store_true')
@@ -281,6 +290,7 @@ def get_common_argparser():
     parser.add_argument('--bc_rew_weight', '-bc', type=float, default=0.0)
     parser.add_argument('--bc_beta', '-beta', type=float, default=500.0)
     parser.add_argument('--contact_beta', '-cbeta', type=float, default=10.0)
+    parser.add_argument('--thumb_weight', '-tw', type=float, default=1.0, help='Weight multiplier for thumb contact reward (e.g., 2.0 = thumb 2x more important)')
     parser.add_argument('--skip_wrist_frame_contact', '-swfc', action='store_true')
     parser.add_argument('--nomask_zero_contact',action='store_true')
     parser.add_argument('--contact_rew_function', '-crf', type=str, default='exp', choices=['exp', 'sigmoid'])
