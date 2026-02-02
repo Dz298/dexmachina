@@ -28,6 +28,10 @@
 
 set -e
 
+# Activate conda environment
+eval "$(conda shell.bash hook)"
+conda activate dexmachina
+
 # Default checkpoint (update this to your trained policy)
 DEFAULT_CK="logs/rl_games/orca_hand/orca-default_retargeted_tuned_gains_box30-230-s01-u01_B8192_hybrid_thres0.6_ho16_imi0.3_con10.0_bc0.3/nn/orca_hand.pth"
 
