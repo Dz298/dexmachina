@@ -71,6 +71,13 @@ ORCA_RIGHT_DEFAULT_QPOS = [
     -0.50477,  # right_thumb_dip (MJCF ref=-0.50477)
 ]
 
+finger_kp = 240.0  # Increased from 20 for tighter tracking
+finger_kv = 9.3   # Increased from 1.5 (kv should be ~sqrt(kp)/2 for critical damping)
+wrist_rot_kp = 240.0  # Increased from 60 for better wrist tracking
+wrist_rot_kv = 9.3    # Increased from 3.0
+wrist_trans_kp = 900.0  # Already good
+wrist_trans_kv = 18.6   # Slightly increased from 12.0
+force_range = 100.0  # Increased from 50 to allow stronger forces
 
 ORCA_LEFT_CFG = {
     "urdf_path": get_urdf_path(left_rel_urdf),
@@ -87,21 +94,21 @@ ORCA_LEFT_CFG = {
         "finger": dict(
             # Match all finger joints (mcp, abd, pip, dip)
             joint_exprs=[r'left_(thumb|index|middle|ring|pinky)_(mcp|abd|pip|dip)'],
-            kp=80.0,  # Placeholder - tune with tune_gains.py
-            kv=4.0,
-            force_range=50.0,
+            kp=finger_kp,
+            kv=finger_kv,
+            force_range=force_range,
         ),
         "wrist_rot": dict(
             joint_exprs=[r'[LR]_forearm_(roll|pitch|yaw)_link_joint'],
-            kp=100.0,  # Placeholder - tune with tune_gains.py
-            kv=6.0,
-            force_range=50.0,
+            kp=wrist_rot_kp,
+            kv=wrist_rot_kv,
+            force_range=force_range,
         ),
         "wrist_trans": dict(
             joint_exprs=[r'[LR]_forearm_t[xyz]_link_joint'],
-            kp=350.0,  # Placeholder - tune with tune_gains.py
-            kv=15.0,
-            force_range=50.0,
+            kp=wrist_trans_kp,
+            kv=wrist_trans_kv,
+            force_range=force_range,
         ),
     },
     # Collision groups from inspect_raw_urdf.py --gather_geoms
@@ -131,21 +138,21 @@ ORCA_RIGHT_CFG = {
     "actuators": {
         "finger": dict(
             joint_exprs=[r'right_(thumb|index|middle|ring|pinky)_(mcp|abd|pip|dip)'],
-            kp=20.0,
-            kv=1.5,
-            force_range=50.0,
+            kp=finger_kp,
+            kv=finger_kv,
+            force_range=force_range,
         ),
         "wrist_rot": dict(
             joint_exprs=[r'[LR]_forearm_(roll|pitch|yaw)_link_joint'],
-            kp=60.0,
-            kv=5.0,
-            force_range=50.0,
+            kp=wrist_rot_kp,
+            kv=wrist_rot_kv,
+            force_range=force_range,
         ),
         "wrist_trans": dict(
             joint_exprs=[r'[LR]_forearm_t[xyz]_link_joint'],
-            kp=350.0,
-            kv=15.0,
-            force_range=50.0,
+            kp=wrist_trans_kp,
+            kv=wrist_trans_kv,
+            force_range=force_range,
         ),
     },
     # Same collision groups as left hand (symmetric structure)

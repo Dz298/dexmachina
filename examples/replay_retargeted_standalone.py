@@ -8,6 +8,7 @@ Can add randomization to show that exact replay fails with different initial con
 
 import os
 import argparse
+import re
 import torch
 import numpy as np
 import genesis as gs
@@ -16,7 +17,7 @@ from tqdm import tqdm
 import scipy.spatial.transform
 
 from dexmachina.asset_utils import get_asset_path
-from dexmachina.envs.robot import BaseRobot, get_default_robot_cfg
+from dexmachina.envs.robot import BaseRobot, get_default_robot_cfg, get_hand_specific_cfg
 from dexmachina.envs.object import ArticulatedObject, get_arctic_object_cfg
 from dexmachina.envs.demo_data import get_demo_data
 
@@ -66,6 +67,20 @@ def main(args):
     # Add ground
     plane = scene.add_entity(gs.morphs.URDF(file='urdf/plane/plane.urdf', fixed=True))
     
+    # Add platform (cardboard box) to catch the object if it falls
+    CARDBOARD_POS = (0, -0.08, 0.90)
+    cardbox_size = (0.2, 0.2, 0.1)
+    cardbox_surface = gs.surfaces.Rough(roughness=0.1, color=(167/255, 134/255, 103/255, 1.0))
+    cardboard_box = scene.add_entity(
+        gs.morphs.Box(
+            pos=CARDBOARD_POS,
+            size=cardbox_size,
+            fixed=True,
+            visualization=True,
+        ),
+        surface=cardbox_surface,
+    )
+    
     # Add hands
     device = torch.device("cuda")
     hands = {}
@@ -108,6 +123,43 @@ def main(args):
         hand.post_scene_build_setup()
     obj.post_scene_build_setup()
     
+    # Set PD gains from hand config (AFTER scene is built)
+    hand_cfg = get_hand_specific_cfg(name=hand_name)
+    print("\nSetting PD gains from hand config:")
+    for side in ['left', 'right']:
+        hand = hands[side]
+        actuator_cfgs = hand_cfg[side]['actuators']
+        for joint_group, act_cfg in actuator_cfgs.items():
+            joint_exprs = act_cfg['joint_exprs']
+            kp = act_cfg['kp']
+            kv = act_cfg['kv']
+            fr = act_cfg['force_range']
+            
+            # Find joints matching the patterns
+            joint_names = []
+            joint_idxs = []
+            for joint in hand.entity.joints:
+                if joint.type not in [gs.JOINT_TYPE.REVOLUTE, gs.JOINT_TYPE.PRISMATIC]:
+                    continue
+                jname = joint.name
+                for expr in joint_exprs:
+                    if bool(re.match(expr, jname)):
+                        joint_names.append(jname)
+                        joint_idxs.append(joint.dof_idx_local)
+                        break
+            
+            if len(joint_idxs) > 0:
+                num_joints = len(joint_idxs)
+                kp_tensor = torch.tensor([kp] * num_joints, dtype=torch.float32)
+                kv_tensor = torch.tensor([kv] * num_joints, dtype=torch.float32)
+                fr_tensor = torch.tensor([fr] * num_joints, dtype=torch.float32)
+                
+                hand.entity.set_dofs_kp(kp_tensor, dofs_idx_local=joint_idxs)
+                hand.entity.set_dofs_kv(kv_tensor, dofs_idx_local=joint_idxs)
+                hand.entity.set_dofs_force_range(-fr_tensor, fr_tensor, dofs_idx_local=joint_idxs)
+                
+                print(f"  {side} {joint_group}: kp={kp}, kv={kv}, fr={fr} ({len(joint_idxs)} joints)")
+    
     # Prepare data - extract from start_frame onwards
     obj_pos = torch.tensor(demo_data['obj_pos'][args.start_frame:args.start_frame+num_steps], device=device)
     obj_quat = torch.tensor(demo_data['obj_quat'][args.start_frame:args.start_frame+num_steps], device=device)
@@ -146,13 +198,21 @@ def main(args):
     }
     print()
     
-    # Set initial object state ONCE (before replay loop)
+    # Set initial object state (before replay loop)
     obj.set_object_state(
         root_pos=obj_pos_init,
         root_quat=obj_quat_init,
         joint_qpos=obj_arti_init,
         env_idxs=[0]
     )
+    
+    # Set initial hand positions to match start_frame of retargeted trajectory
+    print("Setting initial hand positions to match retargeted trajectory at start frame...")
+    for side in ['left', 'right']:
+        hand = hands[side]
+        init_qpos = hand_qposes[side][0:1]  # First frame of the trajectory
+        hand.set_joint_position(init_qpos, env_idxs=[0])
+        print(f"  {side} hand initialized to frame {args.start_frame}")
     
     print("Starting replay...")
     print("="*60)
@@ -166,11 +226,11 @@ def main(args):
         # Object is simulated (not set) - it responds to hand contacts
         # Only hands follow the exact trajectory
         
-        # Set hand positions
+        # Control hand positions using PD controller (not kinematic setting)
         for side in ['left', 'right']:
             hand = hands[side]
             target_qpos = hand_qposes[side][step:step+1]
-            hand.set_joint_position(target_qpos, env_idxs=[0])
+            hand.control_joint_position(target_qpos, env_idxs=[0])
         
         scene.step()
         

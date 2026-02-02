@@ -18,7 +18,7 @@ OBJ="box"
 HAND="orca_hand"
 MAX_STEPS=200  # Longer sequence for better visualization
 OUTPUT_DIR="outputs/replay"
-OUTPUT_NAME="orca_hand_replay.mp4"
+OUTPUT_NAME="orca_hand_replay_pd_control.mp4"
 
 echo "Recording $MAX_STEPS steps to video..."
 echo "Output: $OUTPUT_DIR/$OUTPUT_NAME"
@@ -32,6 +32,7 @@ python examples/replay_retargeted_standalone.py \
     --output_dir "$OUTPUT_DIR" \
     --output_name "$OUTPUT_NAME" \
     --fps 30 \
+    --start_frame 30 \
     "$@"
 
 echo ""

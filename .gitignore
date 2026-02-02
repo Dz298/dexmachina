@@ -180,3 +180,7 @@ cython_debug/
 
 # video
 *.mp4
+
+# metrics
+*.npz
+*.json
