@@ -2,39 +2,26 @@
 # Training script for Orca Hand on box manipulation task
 
 HAND=orca_hand
-CLIP=box-30-230
+CLIP=box-100-230
 
-# # Option 1: Hybrid mode + hand demo diff + trajectory lookahead (NEW)
-# # Tests if observing hand deviation AND future trajectory improves learning
-# # -ohdd: observe hand demo diff (deviation from demo)
-# # -otl 5: observe trajectory lookahead (next 5 frames of demo as delta)
-# EXP_NAME=hybrid_demo_diff_lookahead
-# python dexmachina/rl/train_rl_games.py -B 6000 -obf -obt -ohdd -otl 5 --max_epochs 5000 \
-#     --actuate_object --retarget_name para --horizon 16 -imw 0.5 --gain_mode all \
-#     --curr_schedule uniform --wait_epochs 100 --learning_rate 0.0003 \
-#     --contact_beta 10 --upper_ratios 0.9 0.9 1 --lower_ratios 0.8 0.8 1 \
-#     --save_freq 5000 --group_collisions --fixed_mode uniform --uniform_mode slow \
-#     --action_penalty 0.01 --dialback_ep_len 80 --skip_grad --deque_len 30 \
-#     --task_rew_betas 10 1 5 --use_retarget_contact \
-#     --aux_reset_thres 0 0 0 --curr_rew_thres 0.6 0.01 0.01 0.01 \
-#     -am hybrid --hybrid_scales 0.1 1.0 --kp_init 80 --kv_init 5 \
-#     --clip $CLIP -imi 0.3 -bc 0.3 -con 10 -ert 0.6 -exp $EXP_NAME --hand $HAND
+# Full run with thumb weighting (5000 epochs)
+EXP_NAME=hybrid_very_low_gains_both
+python dexmachina/rl/train_rl_games.py -B 6000 -obf -obt --max_epochs 5000 \
+    --actuate_object --retarget_name para --horizon 16 -imw 0.5 --gain_mode all \
+    --curr_schedule uniform --wait_epochs 100 --learning_rate 0.0003 \
+    --contact_beta 10 --upper_ratios 0.9 0.9 1 --lower_ratios 0.8 0.8 1 \
+    --save_freq 5000 --group_collisions --fixed_mode uniform --uniform_mode slow \
+    --action_penalty 0.01 --dialback_ep_len 80 --skip_grad --deque_len 30 \
+    --task_rew_betas 10 1 5 --use_retarget_contact \
+    --aux_reset_thres 0 0 0 --curr_rew_thres 0.6 0.01 0.01 0.01 \
+    -am hybrid --hybrid_scales 0.1 1.0 --kp_init 80 --kv_init 5 \
+    --thumb_weight 4.0 \
+    --clip $CLIP -imi 0.3 -bc 0.3 -con 10 -ert 0.6 -exp $EXP_NAME --hand $HAND 
+    
 
-# # Option 3: Original hybrid mode (baseline, no new observations)
-# EXP_NAME=hybrid_baseline
-# python dexmachina/rl/train_rl_games.py -B 4096 -obf -obt --max_epochs 5000 \
-#     --actuate_object --retarget_name para --horizon 16 -imw 0.5 --gain_mode all \
-#     --curr_schedule uniform --wait_epochs 100 --learning_rate 0.0003 \
-#     --contact_beta 10 --upper_ratios 0.9 0.9 1 --lower_ratios 0.8 0.8 1 \
-#     --save_freq 5000 --group_collisions --fixed_mode uniform --uniform_mode slow \
-#     --action_penalty 0.01 --dialback_ep_len 80 --skip_grad --deque_len 30 \
-#     --task_rew_betas 10 1 5 --use_retarget_contact \
-#     --aux_reset_thres 0 0 0 --curr_rew_thres 0.6 0.01 0.01 0.01 \
-#     -am hybrid --hybrid_scales 0.1 1.0 --kp_init 80 --kv_init 5 \
-#     --clip $CLIP -imi 0.3 -bc 0.3 -con 10 -ert 0.6 -exp $EXP_NAME --hand $HAND
 
-# # Option 6: Full run with thumb weighting (5000 epochs)
-# EXP_NAME=hybrid_thumb_weight_4x_full
+# # # ============================================================================
+# EXP_NAME=residual_less_stiff_gains_start_in_contact
 # python dexmachina/rl/train_rl_games.py -B 6000 -obf -obt --max_epochs 5000 \
 #     --actuate_object --retarget_name para --horizon 16 -imw 0.5 --gain_mode all \
 #     --curr_schedule uniform --wait_epochs 100 --learning_rate 0.0003 \
@@ -43,24 +30,31 @@ CLIP=box-30-230
 #     --action_penalty 0.01 --dialback_ep_len 80 --skip_grad --deque_len 30 \
 #     --task_rew_betas 10 1 5 --use_retarget_contact \
 #     --aux_reset_thres 0 0 0 --curr_rew_thres 0.6 0.01 0.01 0.01 \
-#     -am hybrid --hybrid_scales 0.1 1.0 --kp_init 80 --kv_init 5 \
+#     -am residual --res_cap --hybrid_scales 0.1 1.0 --kp_init 80 --kv_init 5 \
 #     --thumb_weight 4.0 \
 #     --clip $CLIP -imi 0.3 -bc 0.3 -con 10 -ert 0.6 -exp $EXP_NAME --hand $HAND
 
-# Option 7: Residual mode + all features (thumb weight, lookahead, hand demo diff)
-# -am residual: residual action mode (policy outputs delta from demo)
-# -ohdd: observe hand demo diff (deviation from demo)
-# -otl 5: observe trajectory lookahead (next 5 frames)
-# --thumb_weight 4.0: 4x weight on thumb contacts
-EXP_NAME=residual_full_features
-python dexmachina/rl/train_rl_games.py -B 6000 -obf -obt -ohdd -otl 5 --max_epochs 5000 \
-    --actuate_object --retarget_name para --horizon 16 -imw 0.5 --gain_mode all \
-    --curr_schedule uniform --wait_epochs 100 --learning_rate 0.0003 \
-    --contact_beta 10 --upper_ratios 0.9 0.9 1 --lower_ratios 0.8 0.8 1 \
-    --save_freq 5000 --group_collisions --fixed_mode uniform --uniform_mode slow \
-    --action_penalty 0.01 --dialback_ep_len 80 --skip_grad --deque_len 30 \
-    --task_rew_betas 10 1 5 --use_retarget_contact \
-    --aux_reset_thres 0 0 0 --curr_rew_thres 0.6 0.01 0.01 0.01 \
-    -am residual --res_cap --hybrid_scales 0.1 1.0 --kp_init 80 --kv_init 5 \
-    --thumb_weight 4.0 \
-    --clip $CLIP -imi 1.0 -bc 0.1 -con 15 -ert 0.6 -exp $EXP_NAME --hand $HAND
+
+# # ============================================================================
+# Policy residual mode: Train a residual policy on top of a trained base policy
+# This trains a policy that adds corrections to an already-trained policy
+# instead of on top of blind retargeted motion
+# 
+# USAGE: First train a base policy (e.g., hybrid mode above), then use its
+# checkpoint path with -bpp flag
+# ============================================================================
+# BASE_POLICY_PATH="logs/rl_games/orca_hand/orca-hybrid_less_stiff_gains_start_in_contact_box100-230-s01-u01_B6000_hybrid_thres0.6_ho16_imi0.3_con10.0_bc0.3/nn/orca_hand.pth"
+# EXP_NAME=policy_residual_constant_margin
+# python dexmachina/rl/train_rl_games.py -B 6000 -obf -obt --max_epochs 5000 \
+#     --actuate_object --retarget_name para --horizon 16 -imw 0.5 --gain_mode all \
+#     --curr_schedule uniform --wait_epochs 100 --learning_rate 0.0003 \
+#     --contact_beta 10 --upper_ratios 0.9 0.9 1 --lower_ratios 0.8 0.8 1 \
+#     --save_freq 5000 --group_collisions --fixed_mode uniform --uniform_mode slow \
+#     --action_penalty 0.01 --dialback_ep_len 80 --skip_grad --deque_len 30 \
+#     --task_rew_betas 10 1 5 --use_retarget_contact \
+#     --aux_reset_thres 0 0 0 --curr_rew_thres 0.6 0.01 0.01 0.01 \
+#     -am policy_residual --res_cap --hybrid_scales 0.1 1.0 --kp_init 80 --kv_init 5 \
+#     --base_policy_path $BASE_POLICY_PATH \
+#     --thumb_weight 4.0 \
+#     --clip $CLIP -imi 0.3 -bc 0.3 -con 10 -ert 0.6 -exp $EXP_NAME --hand $HAND
+

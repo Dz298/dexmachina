@@ -611,9 +611,28 @@ class BaseEnv:
         self.last_actions[:] = self.actions
         self.actions[:] = torch.clamp(actions, -self.action_clip, self.action_clip) * self.action_scale
         
+        # For policy_residual mode, run base policy ONCE for all robots
+        base_policy_actions = None
+        for k, robot in self.robots.items():
+            if robot.action_mode == "policy_residual":
+                if base_policy_actions is None:
+                    # Run base policy once and cache the result (exclude base_action from obs)
+                    base_policy_obs = self.get_observations(include_base_action=False)
+                    if self.use_rl_games:
+                        base_policy_obs = base_policy_obs["policy"]
+                    base_policy_actions = robot.get_base_policy_actions(base_policy_obs)
+                break
+        
+        # Step each robot with appropriate actions
         for k, robot in self.robots.items():
             idxs = self.action_idxs_to_robot[k]
-            robot.step(self.actions[:, idxs], self._step_env_idxs)
+            if robot.action_mode == "policy_residual":
+                # Extract this robot's portion of base policy actions
+                robot_base_actions = base_policy_actions[:, idxs]
+                robot.step(self.actions[:, idxs], self._step_env_idxs, obs=self.obs_buf, 
+                          base_actions=robot_base_actions)
+            else:
+                robot.step(self.actions[:, idxs], self._step_env_idxs)
         for k, obj in self.objects.items():
             obj.step()
             
@@ -844,11 +863,11 @@ class BaseEnv:
             contact_dict[key] = self.prepare_sliced_contact(source, part, side) 
         self.update_contact_markers(contact_dict)
             
-    def get_observations(self):
+    def get_observations(self, include_base_action=True):
         value_list = []
         all_obs_dict = dict()
         for name, robot in self.robots.items():
-            obs_dict = robot.get_observations()
+            obs_dict = robot.get_observations(include_base_action=include_base_action)
             value_list.extend(list(obs_dict.values()))
             all_obs_dict[name] = obs_dict
         for name, obj in self.objects.items():

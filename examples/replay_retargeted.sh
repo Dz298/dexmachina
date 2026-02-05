@@ -16,7 +16,7 @@ echo ""
 # Default parameters
 OBJ="box"
 HAND="orca_hand"
-MAX_STEPS=200  # Longer sequence for better visualization
+MAX_STEPS=130  # Longer sequence for better visualization
 OUTPUT_DIR="outputs/replay"
 OUTPUT_NAME="orca_hand_replay_pd_control.mp4"
 
@@ -32,7 +32,7 @@ python examples/replay_retargeted_standalone.py \
     --output_dir "$OUTPUT_DIR" \
     --output_name "$OUTPUT_NAME" \
     --fps 30 \
-    --start_frame 30 \
+    --start_frame 100 \
     "$@"
 
 echo ""

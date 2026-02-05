@@ -137,6 +137,9 @@ def get_all_env_cfg(args, device, load_retarget_data=True):
         robot_cfgs[side]['hybrid_scales'] = tuple(args.hybrid_scales)
         robot_cfgs[side]['res_cap'] = args.res_cap
         robot_cfgs[side]['show_keypoints'] = args.show_kpts
+        if args.action_mode == 'policy_residual':
+            assert args.base_policy_path is not None, "Must provide --base_policy_path for policy_residual mode"
+            robot_cfgs[side]['base_policy_path'] = args.base_policy_path
         if args.hide_hand:
             robot_cfgs[side]['visualization'] = False
 
@@ -258,11 +261,12 @@ def get_common_argparser():
     parser.add_argument('--show_markers', action='store_true', help='Whether to show contact markers')
     parser.add_argument('--interp', type=int, default=1, help='Interpolation multiplier for the demo data')
     parser.add_argument('--seed', type=int, default=42) 
-    parser.add_argument('--action_mode', '-am', default='residual', choices=['residual', 'absolute', 'relative', 'hybrid','kinematic'])
+    parser.add_argument('--action_mode', '-am', default='residual', choices=['residual', 'absolute', 'relative', 'hybrid','kinematic', 'policy_residual'])
     parser.add_argument('--show_kpts', action='store_true', help='Whether to show keypoints')
     parser.add_argument('--res_cap', action='store_true')
     parser.add_argument('--hybrid_scales', type=float, nargs='+', default=[0.04, 0.5])
     parser.add_argument('--hide_hand', action='store_true')
+    parser.add_argument('--base_policy_path', '-bpp', type=str, default=None, help='Path to base policy checkpoint for policy_residual mode')
 
     parser.add_argument('--last_n_frame', type=int, default=-1)
     parser.add_argument('--early_reset_threshold', '-ert', type=float, default=0.5)

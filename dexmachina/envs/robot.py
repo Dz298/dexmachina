@@ -104,9 +104,24 @@ class BaseRobot:
         )
         
         self.action_mode = robot_cfg.get("action_mode", "residual")
-        assert self.action_mode in ["residual", "absolute", "relative", "hybrid", "kinematic"], f"Invalid action mode {self.action_mode}"
+        assert self.action_mode in ["residual", "absolute", "relative", "hybrid", "kinematic", "policy_residual"], f"Invalid action mode {self.action_mode}"
         self.hybrid_scales = robot_cfg.get("hybrid_scales", (0.04, 0.5))
         self.res_cap = robot_cfg.get("res_cap", False)
+        
+        # Setup base policy for policy_residual mode
+        self.base_policy = None
+        self.base_policy_obs_buf = None
+        self.base_policy_path = None
+        self.base_policy_initialized = False
+        self.base_action_mode = None
+        self.base_hybrid_scales = None
+        self.base_res_cap = None
+        self.base_actions_buf = None
+        if self.action_mode == "policy_residual":
+            self.base_policy_path = robot_cfg.get("base_policy_path", None)
+            assert self.base_policy_path is not None, "Must provide base_policy_path for policy_residual mode"
+            print(f"[INFO] Will load base policy from {self.base_policy_path} on first use")
+        
         self.num_envs = num_envs
         self.scene = scene
         assert not self.initialized, "Robot already initialized"
@@ -340,6 +355,94 @@ class BaseRobot:
         max_delta = torch.max(deltas, dim=0).values
         self.relative_step_size = max_delta * 2.0 # shape (ndof,)
 
+    def _load_base_policy(self, checkpoint_path):
+        """Load a trained policy to use as the base controller for policy_residual mode"""
+        import yaml
+        import pickle
+        import gym
+        from rl_games.torch_runner import Runner
+        from rl_games.common.algo_observer import IsaacAlgoObserver
+        from rl_games.algos_torch import torch_ext
+        from dexmachina.asset_utils import get_rl_config_path
+        
+        print(f"[INFO] Loading base policy from {checkpoint_path}")
+        
+        # Load the agent config
+        agent_cfg_fname = get_rl_config_path("rl_games_ppo_cfg")
+        with open(agent_cfg_fname, encoding="utf-8") as f:
+            agent_cfg = yaml.full_load(f)
+        
+        # Create a runner and player (agent)
+        runner = Runner()
+        runner.load(agent_cfg)
+
+        # Build env_info directly from checkpoint to avoid obs-dim mismatch
+        checkpoint = torch_ext.load_checkpoint(os.path.abspath(checkpoint_path))
+        first_layer = checkpoint["model"]["a2c_network.actor_mlp.0.weight"]
+        input_dim = first_layer.shape[1]
+        action_dim = checkpoint["model"]["a2c_network.mu.weight"].shape[0]
+        env_info = {
+            "observation_space": gym.spaces.Box(-1.0, 1.0, shape=(input_dim,), dtype=np.float32),
+            "action_space": gym.spaces.Box(-1.0, 1.0, shape=(action_dim,), dtype=np.float32),
+            "agents": 1,
+            "value_size": 1,
+        }
+        agent_cfg["params"]["config"]["env_info"] = env_info
+        runner.params["config"]["env_info"] = env_info
+        agent = runner.create_player()
+        
+        # Load checkpoint
+        agent.restore(os.path.abspath(checkpoint_path))
+        agent.reset()
+        
+        # Store the agent for inference
+        self.base_policy = agent
+        self.base_policy_initialized = False  # Track if we've initialized batch size and RNN
+        print(f"[INFO] Base policy loaded successfully")
+
+        # Load base policy env config to match action mode/scales
+        base_root = os.path.dirname(os.path.dirname(os.path.abspath(checkpoint_path)))
+        env_pkl_path = os.path.join(base_root, "params", "env.pkl")
+        if os.path.exists(env_pkl_path):
+            try:
+                with open(env_pkl_path, "rb") as f:
+                    env_kwargs = pickle.load(f)
+                base_robot_cfg = env_kwargs.get("robot_cfgs", {}).get("left", {})
+                self.base_action_mode = base_robot_cfg.get("action_mode", None)
+                self.base_hybrid_scales = base_robot_cfg.get("hybrid_scales", None)
+                self.base_res_cap = base_robot_cfg.get("res_cap", None)
+                print(f"[INFO] Base policy action_mode={self.base_action_mode}, "
+                      f"hybrid_scales={self.base_hybrid_scales}, res_cap={self.base_res_cap}")
+            except Exception as e:
+                print(f"[WARNING] Failed to load base env config from {env_pkl_path}: {e}")
+        else:
+            print(f"[WARNING] Base env config not found at {env_pkl_path}; "
+                  f"using current action_mode settings for base policy")
+    
+    def set_base_policy_obs(self, obs):
+        """Store observations for base policy inference and initialize if needed"""
+        # Lazy load the base policy on first use (after env is fully registered)
+        if self.base_policy is None and self.base_policy_path is not None:
+            self._load_base_policy(self.base_policy_path)
+        
+        self.base_policy_obs_buf = obs
+        
+        # Initialize the base policy on first call
+        if not self.base_policy_initialized:
+            # Set batch size for the policy
+            _ = self.base_policy.get_batch_size(obs, 1)
+            # Initialize RNN states if used
+            if self.base_policy.is_rnn:
+                self.base_policy.init_rnn()
+            self.base_policy_initialized = True
+    
+    def get_base_policy_actions(self, obs):
+        """Get actions from base policy - should be called once per env step"""
+        self.set_base_policy_obs(obs)
+        with torch.inference_mode():
+            base_actions = self.base_policy.get_action(obs, is_deterministic=True)
+        return base_actions
+
     def set_custom_joint_limits(self, joint_limits_dict: Dict):
         """ NOTE: skip finger joints """
         joint_limits = self.dof_limits.clone()
@@ -490,6 +593,10 @@ class BaseRobot:
         self.curr_targets = self.init_qpos.clone()
         self.prev_targets = self.init_qpos.clone()
         self.curr_res_qpos = self.init_qpos.clone()
+        if self.action_mode == "policy_residual":
+            self.base_actions_buf = torch.zeros(
+                (self.num_envs, self.action_dim), dtype=torch.float32, device=self.device
+            )
 
         # track keypoint links 
         self.kpt_pos = torch.zeros((self.num_envs, self.n_kpts, 3), dtype=torch.float32, device=self.device)
@@ -524,7 +631,7 @@ class BaseRobot:
             nan_mask |= torch.isnan(values.flatten(start_dim=1)).any(dim=-1)
         return nan_mask
  
-    def get_observations(self):
+    def get_observations(self, include_base_action=True):
         assert self.initialized, "Robot not initialized"  
         target_pos_diff = self.curr_targets - self.dof_pos
         obs_dict = { 
@@ -538,6 +645,8 @@ class BaseRobot:
             "kpt_pos": self.kpt_pos.view(self.num_envs, -1),
             "wrist_pose": self.wrist_pose, 
         }
+        if include_base_action and self.action_mode == "policy_residual":
+            obs_dict["base_action"] = self.base_actions_buf
 
         for k, scale in self.obs_scale.items():
             if k in obs_dict:
@@ -552,9 +661,53 @@ class BaseRobot:
             kpt_dim = int(len(self.kpt_link_names) * 3),  
             wrist_dim = 7, 
         )
+        if self.action_mode == "policy_residual":
+            dims["base_action_dim"] = self.action_dim
         return sum(dims.values()), dims
 
-    def translate_actions(self, actions, episode_length_buf):
+    def _map_actions_to_joint_targets(self, joint_actions, action_mode, res_qpos,
+                                      lower_limit, upper_limit, hybrid_scales, res_cap):
+        if action_mode == "residual":
+            assert res_qpos is not None, "Residual qpos not set"
+            upper_margin = upper_limit - res_qpos
+            lower_margin = res_qpos - lower_limit
+            if res_cap:
+                scale_trans, scale_rot = hybrid_scales
+                upper_margin[:, self.wrist_dof_idxs[:3]] = scale_trans
+                upper_margin[:, self.wrist_dof_idxs[3:]] = scale_rot
+                lower_margin[:, self.wrist_dof_idxs[:3]] = -scale_trans
+                lower_margin[:, self.wrist_dof_idxs[3:]] = -scale_rot
+            upper = joint_actions >= 0
+            scaled = torch.where(upper, joint_actions * upper_margin, joint_actions * lower_margin)
+            return res_qpos + scaled
+
+        if action_mode == "kinematic":
+            assert res_qpos is not None, "Residual qpos not set"
+            return res_qpos
+
+        if action_mode == "relative":
+            deltas = joint_actions * self.relative_step_size
+            return self.dof_pos + deltas
+
+        if action_mode == "absolute":
+            return lower_limit + (upper_limit - lower_limit) * (joint_actions + 1) / 2
+
+        if action_mode == "hybrid":
+            assert res_qpos is not None, "Residual qpos not set"
+            wrist_actions = torch.clamp(joint_actions[:, self.wrist_dof_idxs], -1, 1)
+            scale_trans, scale_rot = hybrid_scales
+            wrist_trans = res_qpos[:, self.wrist_dof_idxs[:3]] + scale_trans * wrist_actions[:, :3]
+            wrist_rot = res_qpos[:, self.wrist_dof_idxs[3:]] + scale_rot * wrist_actions[:, 3:6]
+
+            finger_actions = joint_actions[:, self.finger_dof_idxs]
+            finger_targets = lower_limit[self.finger_dof_idxs] + (
+                upper_limit[self.finger_dof_idxs] - lower_limit[self.finger_dof_idxs]
+            ) * (finger_actions + 1) / 2
+            return torch.concatenate([wrist_trans, wrist_rot, finger_targets], dim=-1)
+
+        raise NotImplementedError(f"Unknown action_mode: {action_mode}")
+
+    def translate_actions(self, actions, episode_length_buf, base_policy_actions=None):
         assert self.initialized, "Robot not initialized"
         assert actions.shape[-1] == self.action_dim, f"actions.shape={actions.shape} != {self.action_dim}" 
         # first map low-dim action to joint targets 
@@ -562,6 +715,7 @@ class BaseRobot:
         # assume actions are in [-1, 1], scale based on default init pos and limits
         upper_limit = self.dof_limits[:, 1] # shape (n_envs,)
         lower_limit = self.dof_limits[:, 0] # shape shape (n_envs,) 
+        res_qpos = None
         if self.residual_qpos is not None:
             demo_t = torch.where(
                 episode_length_buf >= self.residual_num_frames, 
@@ -571,52 +725,54 @@ class BaseRobot:
             res_qpos = self.residual_qpos[demo_t] # shape (n_envs, ndof)
             self.curr_res_qpos[:] = res_qpos
             
-        if self.action_mode == "residual":
-            assert self.residual_qpos is not None and self.residual_num_frames is not None, "Residual qpos not set"   
-            # NOTE there's an implicit broadcast here bc actions is shape (n_envs, ndof). init_qpos is also shape (ndof,)
-            # scale action to add to centering default init pos 
-            upper_margin = upper_limit - res_qpos  # shape (n_envs, 1)
-            lower_margin = res_qpos - lower_limit  # shape (n_envs, 1)
+        if self.action_mode == "policy_residual":
+            # Base policy actions should be provided from environment level
+            # to ensure base policy runs only once per step
+            assert base_policy_actions is not None, "Base policy actions not provided"
+            
+            # Get base joint targets from base policy actions (already sliced for this robot)
+            base_joint_actions = base_policy_actions[:, self.action_from_idxs]
+
+            base_action_mode = self.base_action_mode or "hybrid"
+            base_hybrid_scales = tuple(self.base_hybrid_scales) if self.base_hybrid_scales is not None else self.hybrid_scales
+            base_res_cap = self.base_res_cap if self.base_res_cap is not None else self.res_cap
+
+            base_joint_targets = self._map_actions_to_joint_targets(
+                base_joint_actions,
+                base_action_mode,
+                res_qpos,
+                lower_limit,
+                upper_limit,
+                base_hybrid_scales,
+                base_res_cap,
+            )
+            
+            # Add residual actions on top of base policy targets
+            upper_margin = upper_limit - base_joint_targets
+            lower_margin = base_joint_targets - lower_limit
             if self.res_cap:
                 scale_trans, scale_rot = self.hybrid_scales
                 upper_margin[:, self.wrist_dof_idxs[:3]] = scale_trans
                 upper_margin[:, self.wrist_dof_idxs[3:]] = scale_rot
                 lower_margin[:, self.wrist_dof_idxs[:3]] = -scale_trans
                 lower_margin[:, self.wrist_dof_idxs[3:]] = -scale_rot
-            # joint_actions is -1, 1, make it center around init_qpos
-            upper = joint_actions >= 0 
-            scaled = torch.where(upper, joint_actions * upper_margin, joint_actions * lower_margin) # joint_actions has sign +-1!!
-            joint_targets = res_qpos + scaled
-
-        elif self.action_mode == "kinematic": # just all zeros
-            assert self.residual_qpos is not None and self.residual_num_frames is not None, "Residual qpos not set"
-            joint_targets = res_qpos    
-
-        elif self.action_mode == "relative":
-            # translates policy action to a delta, then add to previous target & clamp 
-            deltas = joint_actions * self.relative_step_size # shape (n_envs, ndof) 
-            joint_targets = self.dof_pos + deltas 
-
-        elif self.action_mode == "absolute":
-            joint_targets = lower_limit + (upper_limit - lower_limit) * (joint_actions + 1) / 2 # shape (n_envs, ndof)
-        
-        elif self.action_mode == "hybrid": # only residual on wrist joints, absolute on finger joints, use self.wrist_dof_idxs and self.finger_dof_idxs
-            assert self.residual_qpos is not None and self.residual_num_frames is not None, "Residual qpos not set"
-            # from objdex paper: wrist delta actions ±4 centimeters for transition and ±0.5 radian for rotation 
-            wrist_actions = torch.clamp(joint_actions[:, self.wrist_dof_idxs], -1, 1) # shape (n_envs, 6)
-            wrist_trans_actions = joint_actions[:, self.wrist_dof_idxs[:3]] # shape (n_envs, 3)
-            wrist_rot_actions = joint_actions[:, self.wrist_dof_idxs[3:]] # shape (n_envs, 3)
-            scale_trans, scale_rot = self.hybrid_scales
-            wrist_trans = self.curr_res_qpos[:, self.wrist_dof_idxs[:3]] + scale_trans * wrist_actions[:, :3] # shape (n_envs, 3)
-            wrist_rot = self.curr_res_qpos[:, self.wrist_dof_idxs[3:]] + scale_rot * wrist_actions[:, 3:6] # shape (n_envs, 3)
-
-            finger_actions = joint_actions[:, self.finger_dof_idxs]
-            finger_targets = lower_limit[self.finger_dof_idxs] + (upper_limit[self.finger_dof_idxs] - lower_limit[self.finger_dof_idxs]) * (finger_actions + 1) / 2
             
-            joint_targets = torch.concatenate([wrist_trans, wrist_rot, finger_targets], dim=-1)
+            upper = joint_actions >= 0
+            # scaled_residual = torch.where(upper, joint_actions * upper_margin, joint_actions * lower_margin)
+            scaled_residual = torch.where(upper, joint_actions * upper_limit, joint_actions * lower_limit)
+            joint_targets = base_joint_targets + scaled_residual
             
         else:
-            raise NotImplementedError  
+            joint_targets = self._map_actions_to_joint_targets(
+                joint_actions,
+                self.action_mode,
+                res_qpos,
+                lower_limit,
+                upper_limit,
+                self.hybrid_scales,
+                self.res_cap,
+            )
+
         # ignore the mimic values!
         target_dof_pos = joint_targets[:, self.joint_from_idxs] * self.joint_multipliers # shape (n_envs, ndof), 
         target_dof_pos = torch.clamp(target_dof_pos, lower_limit, upper_limit) 
@@ -747,9 +903,14 @@ class BaseRobot:
         self.curr_targets[:] = joint_targets
         return  
     
-    def step(self, actions, env_idxs=None):
+    def step(self, actions, env_idxs=None, obs=None, base_actions=None):
         assert self.initialized, "Robot not initialized"
-        target_dof_pos = self.translate_actions(actions, self.episode_length_buf)
+        if self.action_mode == "policy_residual" and base_actions is not None:
+            if env_idxs is None:
+                self.base_actions_buf[:] = base_actions
+            else:
+                self.base_actions_buf[env_idxs] = base_actions
+        target_dof_pos = self.translate_actions(actions, self.episode_length_buf, base_policy_actions=base_actions)
         if env_idxs is not None:
             target_dof_pos = target_dof_pos[env_idxs]
         
