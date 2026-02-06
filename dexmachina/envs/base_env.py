@@ -177,6 +177,10 @@ class BaseEnv:
         self.curr_cfg = curriculum_cfg
         self.group_collisions = group_collisions
 
+        # Latent world model config
+        self.use_latent_world_model = env_cfg.get('use_latent_world_model', False)
+        self.wm_latent_dim = env_cfg.get('wm_latent_dim', 32)
+
         self.num_envs = env_cfg['num_envs']
         self.max_video_frames = env_cfg['max_video_frames']
         self.record_video = env_cfg['record_video']
@@ -514,6 +518,11 @@ class BaseEnv:
         ep_len_dim = 1 #* 10
         obs_dim += ep_len_dim
 
+        # Latent world model adds latent_dim to observation
+        if self.use_latent_world_model:
+            obs_idxs['latent'] = (obs_dim, obs_dim + self.wm_latent_dim)
+            obs_dim += self.wm_latent_dim
+
         # return 20, obs_idxs
         return obs_dim, obs_idxs
     
@@ -559,6 +568,11 @@ class BaseEnv:
         if self.use_contact_reward:
             self.contact_link_pos = torch.zeros((self.num_envs, self.num_obj_links, self.num_robot_links, 3), device=self.device)
             self.contact_link_valid = torch.zeros((self.num_envs, self.num_obj_links, self.num_robot_links), device=self.device, dtype=torch.bool)
+        
+        # Latent world model buffer
+        if self.use_latent_world_model:
+            self.latent_buf = torch.zeros((self.num_envs, self.wm_latent_dim), device=self.device)
+        
         self.extras = dict() 
     # def progress_episode_length(self):
     #     self.episode_length_buf += 1
@@ -951,12 +965,54 @@ class BaseEnv:
         all_obs_dict['nan_mask'] = nan_mask
         obs = torch.clamp(obs, -self.obs_clip, self.obs_clip)
 
+        # Append latent from world model if enabled
+        if self.use_latent_world_model:
+            obs = torch.cat([obs, self.latent_buf], dim=-1)
+        
         if self.use_rl_games:
             return dict(policy=obs, itemized=all_obs_dict, critic=obs) # critic for sil
         return obs 
     
     def get_privileged_observations(self): 
         return None
+    
+    def get_object_state(self) -> torch.Tensor:
+        """
+        Get object state for world model decoder target.
+        Returns: (num_envs, 14) tensor with [pos(3), quat(4), dof(1), lin_vel(3), ang_vel(3)]
+        """
+        if self.n_objects == 0:
+            # Return zeros if no object
+            return torch.zeros((self.num_envs, 14), device=self.device)
+        
+        obj = self.objects[self.object_names[0]]
+        return torch.cat([
+            obj.root_pos,      # 3D
+            obj.root_quat,     # 4D
+            obj.dof_pos,       # 1D
+            obj.root_lin_vel,  # 3D
+            obj.root_ang_vel,  # 3D
+        ], dim=-1)
+    
+    def get_obs_without_latent(self) -> torch.Tensor:
+        """
+        Get observation without the latent component (for world model encoder input).
+        Returns the full observation minus the latent_dim trailing dimensions.
+        """
+        if not self.use_latent_world_model:
+            return self.obs_buf
+        # Return obs without the trailing latent dimensions
+        return self.obs_buf[:, :-self.wm_latent_dim]
+    
+    def update_latent(self, latent: torch.Tensor):
+        """
+        Update the latent buffer with new latent encoding.
+        
+        Args:
+            latent: (num_envs, latent_dim) tensor from world model encoder
+        """
+        if self.use_latent_world_model:
+            self.latent_buf[:] = latent
 
     def normalize_episode_rew(self, rewards: torch.Tensor):
         # rewards should be shape (num_envs,)
@@ -1034,7 +1090,11 @@ class BaseEnv:
         
         if self.use_contact_reward:
             self.contact_link_pos[env_idxs] = 0.0
-            self.contact_link_valid[env_idxs] = False  
+            self.contact_link_valid[env_idxs] = False
+        
+        # Reset latent buffer for world model
+        if self.use_latent_world_model:
+            self.latent_buf[env_idxs] = 0.0  
          
     def reset(self): 
         # reset all envs

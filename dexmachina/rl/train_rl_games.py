@@ -18,6 +18,38 @@ from dexmachina.asset_utils import get_rl_config_path
 from dexmachina.envs.base_env import BaseEnv 
 from dexmachina.envs.constructors import get_common_argparser, get_all_env_cfg, parse_clip_string
 from dexmachina.rl.rl_games_wrapper import RlGamesVecEnvWrapper, RlGamesGpuEnv
+from dexmachina.rl.latent_world_model import LatentWorldModel, WorldModelTrainer
+
+
+class WorldModelAlgoObserver(IsaacAlgoObserver):
+    """IsaacAlgoObserver that also saves the world model whenever the policy is saved."""
+
+    def __init__(self, world_model_trainer=None):
+        super().__init__()
+        self.world_model_trainer = world_model_trainer
+
+    def after_init(self, algo):
+        super().after_init(algo)
+        if self.world_model_trainer is None:
+            return
+        original_save = algo.save
+
+        def save_with_world_model(fn, verbose=False):
+            original_save(fn, verbose)
+            nn_dir = os.path.dirname(fn)
+            wm_path = os.path.join(nn_dir, "world_model.pt")
+            os.makedirs(nn_dir, exist_ok=True)
+            self.world_model_trainer.save(wm_path)
+            if verbose:
+                print(f"[INFO] Saved world model to {wm_path}")
+
+        algo.save = save_with_world_model
+
+    def wandb_after_print_stats(self, frame, epoch_num, total_time):
+        tolog = super().wandb_after_print_stats(frame, epoch_num, total_time)
+        if self.world_model_trainer is not None and self.world_model_trainer.last_loss_dict is not None:
+            tolog.update(self.world_model_trainer.last_loss_dict)
+        return tolog
 
 
 def dump_yaml(filename: str, data: dict | object, sort_keys: bool = False):
@@ -79,7 +111,8 @@ def main():
         exp_name += f"_rand{args.rand_init_ratio}"
     if args.bc_rew_weight > 0:
         exp_name += f"_bc{args.bc_rew_weight}"
-        
+    if args.use_latent_world_model:
+        exp_name += f"_wm{args.wm_latent_dim}"
 
     num_envs = args.num_envs   
     env_kwargs = get_all_env_cfg(args, device='cuda:0')
@@ -115,7 +148,31 @@ def main():
         # agent_cfg["params"]["load_checkpoint"] = True
         # agent_cfg["params"]["load_path"] = args.checkpoint     
     
-    env = RlGamesVecEnvWrapper(env, rl_device, clip_obs, clip_actions, use_sil=False)
+    # Create world model if enabled
+    world_model_trainer = None
+    if args.use_latent_world_model:
+        # obs_dim is the full observation minus the latent (which hasn't been added yet during world model creation)
+        obs_dim_without_latent = env.obs_dim - args.wm_latent_dim
+        world_model = LatentWorldModel(
+            obs_dim=obs_dim_without_latent,
+            action_dim=env.action_dim,
+            latent_dim=args.wm_latent_dim,
+            object_state_dim=14,  # pos(3) + quat(4) + dof(1) + lin_vel(3) + ang_vel(3)
+            hidden_dims=args.wm_hidden_dims,
+        ).to(device)
+        world_model_trainer = WorldModelTrainer(
+            world_model=world_model,
+            lr=args.wm_lr,
+            recon_weight=args.wm_recon_weight,
+            dynamics_weight=args.wm_dynamics_weight,
+            rollout_length=args.horizon,
+            num_envs=num_envs,
+            device=device,
+        )
+        print(f"[INFO] Created latent world model with latent_dim={args.wm_latent_dim}")
+    
+    env = RlGamesVecEnvWrapper(env, rl_device, clip_obs, clip_actions, use_sil=False, 
+                               world_model_trainer=world_model_trainer)
     # register the environment to rl-games registry
     # note: in agents configuration: environment name must be "rlgpu"
     vecenv.register(
@@ -144,6 +201,16 @@ def main():
     wandb_cfg['clip'] = f"{obj_name}{start}-{end}-{subject_name}-u{use_clip}"
     wandb_cfg['hand'] = args.hand
     
+    # Add world model config if enabled
+    if args.use_latent_world_model:
+        wandb_cfg['world_model'] = {
+            'latent_dim': args.wm_latent_dim,
+            'hidden_dims': args.wm_hidden_dims,
+            'recon_weight': args.wm_recon_weight,
+            'dynamics_weight': args.wm_dynamics_weight,
+            'lr': args.wm_lr,
+        }
+    
     run = wandb.init(
         project=args.wandb_project, 
         config=wandb_cfg,
@@ -164,8 +231,9 @@ def main():
     # also dump as pkl file 
     pickle.dump(env_kwargs, open(os.path.join(log_root_path, exp_name, "params", "env.pkl"), "wb")) 
 
-    # create runner from rl-games
-    runner = Runner(IsaacAlgoObserver())
+    # create runner from rl-games (use observer that syncs world model save when policy is saved)
+    algo_observer = WorldModelAlgoObserver(world_model_trainer) if args.use_latent_world_model else IsaacAlgoObserver()
+    runner = Runner(algo_observer)
     runner.load(agent_cfg)
 
     # set seed of the env
@@ -177,6 +245,13 @@ def main():
     if args.checkpoint is not None:
         runner_args["checkpoint"] = os.path.abspath(args.checkpoint) 
     runner.run(runner_args)
+
+    # Save world model checkpoint if enabled
+    if args.use_latent_world_model and world_model_trainer is not None:
+        wm_save_path = os.path.join(log_root_path, exp_name, "nn", "world_model.pt")
+        os.makedirs(os.path.dirname(wm_save_path), exist_ok=True)
+        world_model_trainer.save(wm_save_path)
+        print(f"[INFO] Saved world model to {wm_save_path}")
 
     # close the simulator
     exit()

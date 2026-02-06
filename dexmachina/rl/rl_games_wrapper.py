@@ -51,7 +51,8 @@ class RlGamesVecEnvWrapper(IVecEnv):
         https://github.com/NVIDIA-Omniverse/IsaacGymEnvs
     """
 
-    def __init__(self, env, rl_device: str, clip_obs: float, clip_actions: float, use_sil: bool = False):
+    def __init__(self, env, rl_device: str, clip_obs: float, clip_actions: float, use_sil: bool = False,
+                 world_model_trainer=None):
         """Initializes the wrapper instance.
 
         Args:
@@ -59,6 +60,7 @@ class RlGamesVecEnvWrapper(IVecEnv):
             rl_device: The device on which agent computations are performed.
             clip_obs: The clipping value for observations.
             clip_actions: The clipping value for actions.
+            world_model_trainer: Optional WorldModelTrainer for latent world model.
 
         Raises:
             ValueError: The environment is not inherited from :class:`ManagerBasedRLEnv` or :class:`DirectRLEnv`.
@@ -72,6 +74,11 @@ class RlGamesVecEnvWrapper(IVecEnv):
         self._clip_actions = clip_actions
         self._sim_device = env.device
         self.use_sil = use_sil 
+        
+        # World model trainer (optional)
+        self.world_model_trainer = world_model_trainer
+        self._wm_step_count = 0
+        
         # information for privileged observations
         if self.state_space is None:
             self.rlg_num_states = 0
@@ -212,6 +219,17 @@ class RlGamesVecEnvWrapper(IVecEnv):
 
     def reset(self):  # noqa: D102
         obs_dict, _ = self.env.reset()
+        
+        # Initialize latent buffer with world model if enabled
+        if self.world_model_trainer is not None:
+            obs_without_latent = self.env.get_obs_without_latent()
+            initial_latent = self.world_model_trainer.get_latent(obs_without_latent)
+            self.env.update_latent(initial_latent)
+            # Re-get observations with updated latent
+            obs_dict = self.env.get_observations()
+            # Reset world model buffers for new episode
+            self.world_model_trainer.reset_buffers()
+        
         # process observations and states
         return self._process_obs(obs_dict)
 
@@ -220,8 +238,18 @@ class RlGamesVecEnvWrapper(IVecEnv):
         actions = actions.detach().clone().to(device=self._sim_device)
         # clip the actions
         actions = torch.clamp(actions, -self._clip_actions, self._clip_actions)
+        
+        # Get observation without latent BEFORE step (for world model training)
+        obs_before_step = None
+        if self.world_model_trainer is not None:
+            obs_before_step = self.env.get_obs_without_latent().clone()
+        
         # perform environment step
         obs_dict, rew, terminated, truncated, extras = self.env.step(actions)
+
+        # World model: collect data, train, and update latent
+        if self.world_model_trainer is not None:
+            self._update_world_model(obs_before_step, actions, extras)
 
         # move time out information to the extras dict
         # this is only needed for infinite horizon tasks
@@ -242,6 +270,30 @@ class RlGamesVecEnvWrapper(IVecEnv):
             extras["episode"] = extras.pop("log")
 
         return obs_and_states, rew, dones, extras
+    
+    def _update_world_model(self, obs_before_step, actions, extras):
+        """Update world model: collect data, train, and update latent buffer."""
+        # Get object state (decoder target)
+        object_state = self.env.get_object_state()
+        
+        # Add transition to buffer
+        self.world_model_trainer.add_transition(obs_before_step, actions, object_state)
+        self._wm_step_count += 1
+        
+        # Train world model when we have enough data (skip in eval_only mode)
+        if not getattr(self.world_model_trainer, 'eval_only', False) and self.world_model_trainer.has_enough_data():
+            with torch.enable_grad():
+                loss_dict = self.world_model_trainer.train_step()
+            if loss_dict is not None:
+                # Add world model metrics to extras for logging
+                if "log" not in extras:
+                    extras["log"] = {}
+                extras["log"].update(loss_dict)
+        
+        # Update latent buffer with new encoding (using current obs after step)
+        obs_after_step = self.env.get_obs_without_latent()
+        new_latent = self.world_model_trainer.get_latent(obs_after_step)
+        self.env.update_latent(new_latent)
 
     def close(self):  # noqa: D102
         return self.env.close()

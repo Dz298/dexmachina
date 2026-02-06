@@ -117,6 +117,10 @@ def get_all_env_cfg(args, device, load_retarget_data=True):
     env_cfg['use_rl_games'] = args.use_rl_games
     env_cfg['rand_init_ratio'] = args.rand_init_ratio  
     env_cfg['chunk_ep_length'] = args.chunk_ep_length
+    
+    # Latent world model config
+    env_cfg['use_latent_world_model'] = args.use_latent_world_model
+    env_cfg['wm_latent_dim'] = args.wm_latent_dim
 
     if args.record_interval > 0 or args.record_video:
         env_cfg["record_video"] = True
@@ -358,6 +362,20 @@ def get_common_argparser():
     parser.add_argument('--dialback_ep_len', type=int, default=30)
     parser.add_argument('--dialback_min_epochs', type=int, default=500)
     parser.add_argument('--dialback_ratios', type=float, nargs='+', default=[0.98, 1.0, 1.0])
+
+    # Latent world model arguments
+    parser.add_argument('--use_latent_world_model', '-wm', action='store_true', 
+                        help='Enable online latent world model training alongside PPO')
+    parser.add_argument('--wm_latent_dim', type=int, default=32, 
+                        help='Dimension of latent representation')
+    parser.add_argument('--wm_hidden_dims', type=int, nargs='+', default=[256, 256],
+                        help='Hidden layer dimensions for world model MLPs')
+    parser.add_argument('--wm_recon_weight', type=float, default=1.0,
+                        help='Weight for reconstruction loss')
+    parser.add_argument('--wm_dynamics_weight', type=float, default=1.0,
+                        help='Weight for dynamics prediction loss')
+    parser.add_argument('--wm_lr', type=float, default=3e-4,
+                        help='Learning rate for world model')
 
     # additional arguments for maniptrans
     parser.add_argument('--maniptrans', '-mpt', action='store_true')

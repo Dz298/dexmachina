@@ -19,8 +19,8 @@ from dexmachina.envs.base_env import BaseEnv
 from dexmachina.envs.contacts import get_contact_marker_cfgs
 from dexmachina.envs.constructors import get_common_argparser, parse_clip_string  
 from dexmachina.rl.rl_games_wrapper import RlGamesVecEnvWrapper, RlGamesGpuEnv
+from dexmachina.rl.latent_world_model import load_world_model_for_eval, WorldModelTrainer
 
-  
 from collections import defaultdict
 import shutil
 import moviepy
@@ -152,6 +152,21 @@ def main():
         env_kwargs = pickle.load(f)
     
     assert env_kwargs['env_cfg']['use_rl_games'], "The saved environment is not from rl-games"
+
+    # World model: if checkpoint was trained with WM, load it for eval
+    nn_dir = os.path.join(ckpt_path, "nn")
+    world_model_path = os.path.join(nn_dir, "world_model.pt")
+    load_world_model = os.path.exists(world_model_path)
+    wm_latent_dim = None
+    if load_world_model:
+        # Infer latent_dim from checkpoint before creating env
+        _ckpt = torch.load(world_model_path, map_location="cpu")
+        _state = _ckpt["model_state_dict"]
+        _enc_w = [k for k in _state if k.startswith("encoder.") and k.endswith(".weight")]
+        wm_latent_dim = int(_state[max(_enc_w, key=lambda x: int(x.split(".")[1]))].shape[0])
+        env_kwargs["env_cfg"]["use_latent_world_model"] = True
+        env_kwargs["env_cfg"]["wm_latent_dim"] = wm_latent_dim
+        print(f"[INFO] Loading world model from {world_model_path} (latent_dim={wm_latent_dim})")
     
     if args.raytrace and args.record_video:
         env_kwargs['env_cfg']['scene_kwargs']['raytrace'] = True
@@ -207,6 +222,24 @@ def main():
     demo_data = env_kwargs['demo_data']
     obj_state_tensor = gather_object_state_tensor(demo_data)
 
+    # Load world model for eval if this run was trained with WM
+    world_model_trainer = None
+    if load_world_model and wm_latent_dim is not None:
+        obs_dim_without_latent = env.obs_dim - wm_latent_dim
+        world_model, _ = load_world_model_for_eval(
+            world_model_path,
+            obs_dim=obs_dim_without_latent,
+            action_dim=env.action_dim,
+            device=device,
+        )
+        world_model_trainer = WorldModelTrainer(
+            world_model=world_model,
+            num_envs=env.num_envs,
+            device=device,
+            eval_only=True,
+        )
+        world_model_trainer.world_model.eval()
+
     agent_cfg_fname = get_rl_config_path("rl_games_ppo_cfg")
     
     with open(agent_cfg_fname, encoding="utf-8") as f:
@@ -215,7 +248,7 @@ def main():
     clip_obs = agent_cfg["params"]["env"].get("clip_observations", math.inf)
     clip_actions = agent_cfg["params"]["env"].get("clip_actions", math.inf)
 
-    env = RlGamesVecEnvWrapper(env, rl_device, clip_obs, clip_actions)
+    env = RlGamesVecEnvWrapper(env, rl_device, clip_obs, clip_actions, world_model_trainer=world_model_trainer)
     vecenv.register(
         "IsaacRlgWrapper", lambda config_name, num_actors, **kwargs: RlGamesGpuEnv(config_name, num_actors, **kwargs)
     )
