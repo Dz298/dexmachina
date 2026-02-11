@@ -140,6 +140,15 @@ def get_env_cfg(
         'use_rl_games': True,
         "is_eval": False, 
         "rand_init_ratio": 0.0, # randomize initial states  
+        "enforce_valid_rand_init_grasp": False,
+        "valid_grasp_min_contacts": 1,
+        "valid_grasp_contact_thresh": 0.01,
+        "valid_grasp_resample_attempts": 8,
+        "valid_grasp_require_both_hands": False,
+        "valid_grasp_opt_samples": 12,
+        "valid_grasp_step_scale": 0.4,
+        "valid_grasp_object_move_scale": 0.5,
+        "valid_grasp_fallback_to_zero": True,
         "env_spacing": ENV_SPACING,
         "n_envs_per_row": None, # this will default to grid layout 
         "chunk_ep_length": -1,#chunk the episode length
@@ -176,6 +185,18 @@ class BaseEnv:
         self.demo_data = demo_data
         self.curr_cfg = curriculum_cfg
         self.group_collisions = group_collisions
+
+        # Grasp optimization controls must be defined before post_scene_build_setup
+        self.rand_init_ratio = env_cfg.get('rand_init_ratio', 0.0)
+        self.enforce_valid_rand_init_grasp = env_cfg.get('enforce_valid_rand_init_grasp', False)
+        self.valid_grasp_min_contacts = env_cfg.get('valid_grasp_min_contacts', 1)
+        self.valid_grasp_contact_thresh = env_cfg.get('valid_grasp_contact_thresh', 0.01)
+        self.valid_grasp_resample_attempts = env_cfg.get('valid_grasp_resample_attempts', 8)
+        self.valid_grasp_require_both_hands = env_cfg.get('valid_grasp_require_both_hands', False)
+        self.valid_grasp_opt_samples = env_cfg.get('valid_grasp_opt_samples', 12)
+        self.valid_grasp_step_scale = env_cfg.get('valid_grasp_step_scale', 0.4)
+        self.valid_grasp_object_move_scale = env_cfg.get('valid_grasp_object_move_scale', 0.5)
+        self.valid_grasp_fallback_to_zero = env_cfg.get('valid_grasp_fallback_to_zero', True)
 
         # Latent world model config
         self.use_latent_world_model = env_cfg.get('use_latent_world_model', False)
@@ -273,6 +294,8 @@ class BaseEnv:
         self.object = None 
         if len(self.object_names) > 0: 
             self.object = self.objects[self.object_names[0]] # only support one object for now
+        self.obj_verts = dict()
+        self._setup_contact_link_metadata()
         self.n_objects = len(self.object_names) # might be 0!!
        
         self.use_curriculum = False 
@@ -359,6 +382,34 @@ class BaseEnv:
             self.post_scene_build_setup()
         else:
             print("Scene created but not built yet") 
+    
+    def _setup_contact_link_metadata(self):
+        """Map demo contact link ordering to robot link indices for each hand."""
+        self.contact_link_meta = dict()
+        if len(self.robots) == 0:
+            return
+        for side, robot in self.robots.items():
+            demo_side = self.demo_data.get(side, dict())
+            link_names = demo_side.get('collision_link_names', [])
+            if len(link_names) == 0:
+                continue
+            link_idxs = []
+            missing = []
+            for name in link_names:
+                idx = robot.link_name_to_local_idx.get(name)
+                if idx is None:
+                    missing.append(name)
+                else:
+                    link_idxs.append(idx)
+            if len(link_idxs) == 0 or len(missing) > 0:
+                if len(missing) > 0:
+                    print(f"[valid-grasp] Missing collision links for {side}: {missing}")
+                continue
+            self.contact_link_meta[side] = dict(
+                link_names=link_names,
+                link_local_idxs=torch.tensor(link_idxs, dtype=torch.long, device=self.device),
+                num_links=len(link_idxs),
+            )
             
     def build_scene(self):
         env_cfg = self.env_cfg
@@ -374,8 +425,8 @@ class BaseEnv:
         rand_cfg = self.rand_cfg
         self.setup_actions(self.robots) 
         self.observe_tip_dist = env_cfg['observe_tip_dist']
-        if self.observe_tip_dist:
-            # load vertices
+        need_obj_surface_samples = self.observe_tip_dist or self.enforce_valid_rand_init_grasp
+        if need_obj_surface_samples:
             assert self.n_objects == 1, "Only support one object for now"
             obj = self.objects[self.object_names[0]]
             self.obj_verts = {part: obj.sample_mesh_vertices(300, part) for part in ['top', 'bottom']}
@@ -430,7 +481,8 @@ class BaseEnv:
         self.num_obs = self.obs_dim
         self.num_privileged_obs = None
         self.num_actions = self.action_dim # need for rsl
-        self.rand_init_ratio = env_cfg.get('rand_init_ratio', 0.0) 
+        self._demo_contact_cache = dict()
+        self.contact_link_meta = dict()
         self.initialize_value_buffers()
         
         # # NOTE! seems like scene must be built first
@@ -1022,6 +1074,11 @@ class BaseEnv:
     def reset_idx(self, env_idxs=[]):
         if len(env_idxs) == 0:
             return  
+        if isinstance(env_idxs, torch.Tensor):
+            env_idxs_list = env_idxs.tolist()
+        else:
+            env_idxs_list = list(env_idxs)
+        env_idxs_list = [int(idx) for idx in env_idxs_list]
         self.randomization.on_reset_idx(env_idxs)
         progressed = self.episode_length_buf[env_idxs] - self.episode_start_buf[env_idxs]
         progressed_avg = torch.mean(progressed.float()).item()
@@ -1046,18 +1103,21 @@ class BaseEnv:
             self.episode_length_buf[env_idxs] = 0
             self.episode_start_buf[env_idxs] = 0 
         
+        rand_init_mask = None
         if self.rand_init_ratio > 0.0:
             # randomly sample non-zero initial t 
             # num_rand = int(self.rand_init_ratio * len(env_idxs)) + 1
             # treat this as probability 
             torand = torch.rand(len(env_idxs)) <= self.rand_init_ratio
             # randomly sample from any t within max_episode_length
-            end_t = min(self.max_achieved_length + 1, self.max_episode_length - 1)
+            # end_t = min(self.max_achieved_length + 1, self.max_episode_length - 1)
+            end_t = min(100, self.max_episode_length - 1) # TODO: hardcoded for now
             rand_t = torch.randint(0, end_t, (len(env_idxs),), dtype=torch.int32, device=self.device)
             ep_starts = torch.zeros(len(env_idxs), dtype=torch.int32, device=self.device)
             ep_starts[torand] = rand_t[torand] 
             self.episode_length_buf[env_idxs] = ep_starts
             self.episode_start_buf[env_idxs] = ep_starts
+            rand_init_mask = torand.clone()
             
         for k, robot in self.robots.items():
             # need to rand init too
@@ -1065,6 +1125,9 @@ class BaseEnv:
         
         for k, obj in self.objects.items():
             obj.reset_idx(env_idxs, self.episode_start_buf[env_idxs])
+
+        if rand_init_mask is not None:
+            self._ensure_valid_rand_init_grasp(env_idxs_list, rand_init_mask)
 
         self.last_actions[env_idxs] = 0.0
         
@@ -1095,6 +1158,269 @@ class BaseEnv:
         # Reset latent buffer for world model
         if self.use_latent_world_model:
             self.latent_buf[env_idxs] = 0.0  
+    
+    def _ensure_valid_rand_init_grasp(self, env_idxs_list, rand_mask):
+        """Adjust invalid random initializations via contact-aware sampling."""
+        if (
+            not self.enforce_valid_rand_init_grasp
+            or self.rand_init_ratio <= 0.0
+            or self.n_objects == 0
+            or len(env_idxs_list) == 0
+            or rand_mask is None
+        ):
+            return
+        if isinstance(rand_mask, torch.Tensor):
+            rand_flags = rand_mask.to(device='cpu').tolist()
+        else:
+            rand_flags = list(rand_mask)
+        if len(rand_flags) == 0 or not any(rand_flags):
+            return
+        candidate_envs = [
+            int(env_idxs_list[i])
+            for i in range(min(len(env_idxs_list), len(rand_flags)))
+            if rand_flags[i]
+        ]
+        if len(candidate_envs) == 0:
+            return
+        targets_map = {
+            env_idx: self._get_demo_contact_targets_for_env(env_idx)
+            for env_idx in candidate_envs
+        }
+        invalid_envs = []
+        for env_idx in candidate_envs:
+            avg_err = self._evaluate_grasp_quality(env_idx, targets_map[env_idx])
+            if avg_err is None:
+                continue
+            if avg_err > self.valid_grasp_contact_thresh:
+                invalid_envs.append(env_idx)
+        if len(invalid_envs) == 0:
+            return
+        for env_idx in invalid_envs:
+            targets = targets_map.get(env_idx, dict())
+            success = self._optimize_grasp_state(env_idx, targets)
+            if not success and self.valid_grasp_fallback_to_zero:
+                self._reset_env_to_demo_anchor(env_idx)
+
+    def _get_demo_contact_targets_for_env(self, env_idx: int):
+        targets = dict()
+        if len(self.contact_link_meta) == 0:
+            return targets
+        env_idx = int(env_idx)
+        if env_idx < 0 or env_idx >= self.num_envs:
+            return targets
+        env_episode = self.episode_start_buf[env_idx:env_idx+1]
+        for side, meta in self.contact_link_meta.items():
+            key = f"contact_links_{side}"
+            if key not in self.reward_module.demo_tensors:
+                continue
+            demo_state = self.reward_module.match_demo_state(key, env_episode)
+            if demo_state.shape[1] == meta['num_links'] * 2:
+                reshaped = demo_state[0].reshape(2, meta['num_links'], -1)
+            elif demo_state.dim() == 4 and demo_state.shape[2] == meta['num_links']:
+                reshaped = demo_state[0]
+            else:
+                continue
+            positions = reshaped[:, :, :3]
+            part_ids = reshaped[:, :, 3]
+            valid = part_ids > 0
+            targets[side] = dict(
+                positions=positions,
+                valid=valid,
+            )
+        return targets
+
+    def _evaluate_grasp_quality(self, env_idx: int, targets: Dict[str, Dict[str, torch.Tensor]]):
+        if len(targets) == 0:
+            return self._keypoint_grasp_distance(env_idx)
+        error_sum, count, side_counts = self._contact_alignment_error(env_idx, targets)
+        if count == 0:
+            return self._keypoint_grasp_distance(env_idx)
+        if self.valid_grasp_require_both_hands and len(side_counts) > 1:
+            sides_with_contact = sum(1 for v in side_counts.values() if v > 0)
+            if sides_with_contact < len(side_counts):
+                return float('inf')
+        if count < self.valid_grasp_min_contacts:
+            return float('inf')
+        return error_sum / max(count, 1)
+
+    def _keypoint_grasp_distance(self, env_idx: int):
+        if self.n_objects == 0 or len(self.obj_verts) == 0:
+            return None
+        obj = self.object
+        env_idx = int(env_idx)
+        part_poses = dict()
+        for part in ['top', 'bottom']:
+            if part in self.obj_verts:
+                part_poses[part] = obj.get_part_pose(part)
+        if len(part_poses) == 0:
+            return None
+        total = 0.0
+        total_count = 0
+        for side, robot in self.robots.items():
+            dists = []
+            for part, pose in part_poses.items():
+                verts = self.obj_verts.get(part, None)
+                if verts is None:
+                    continue
+                part_dist = self.compute_closest_vertice_dist_single(verts, robot.kpt_pos, pose)
+                dists.append(part_dist[env_idx])
+            if len(dists) == 0:
+                continue
+            stacked = torch.stack(dists, dim=0)
+            min_dists = torch.min(stacked, dim=0).values
+            total += min_dists.sum().item()
+            total_count += min_dists.numel()
+        if total_count == 0:
+            return None
+        return total / total_count
+
+    def _contact_alignment_error(self, env_idx: int, targets: Dict[str, Dict[str, torch.Tensor]]):
+        total_error = 0.0
+        total_count = 0
+        side_counts = dict()
+        for side, target in targets.items():
+            meta = self.contact_link_meta.get(side, None)
+            robot = self.robots.get(side, None)
+            if meta is None or robot is None:
+                continue
+            link_idxs = meta['link_local_idxs']
+            link_pos = robot.entity.get_links_pos()
+            env_link_pos = link_pos[env_idx, link_idxs]
+            pos_expanded = env_link_pos.unsqueeze(0) # (1, num_links, 3)
+            diff = target['positions'] - pos_expanded
+            dists = torch.norm(diff, dim=-1)
+            mask = target['valid']
+            count = int(mask.sum().item())
+            side_counts[side] = count
+            if count > 0:
+                total_error += dists[mask].sum().item()
+                total_count += count
+        return total_error, total_count, side_counts
+
+    def _compute_contact_error_vectors(self, env_idx: int, targets: Dict[str, Dict[str, torch.Tensor]]):
+        vectors = dict()
+        for side, target in targets.items():
+            meta = self.contact_link_meta.get(side, None)
+            robot = self.robots.get(side, None)
+            if meta is None or robot is None:
+                continue
+            link_idxs = meta['link_local_idxs']
+            link_pos = robot.entity.get_links_pos()
+            env_link_pos = link_pos[env_idx, link_idxs]
+            pos_expanded = env_link_pos.unsqueeze(0)
+            diff = target['positions'] - pos_expanded
+            mask = target['valid'].unsqueeze(-1)
+            masked = torch.where(mask, diff, torch.zeros_like(diff))
+            count = target['valid'].sum().item()
+            if count == 0:
+                vectors[side] = torch.zeros(3, device=self.device)
+            else:
+                vectors[side] = masked.sum(dim=(0,1)) / max(count, 1)
+        return vectors
+
+    def _snapshot_env_state(self, env_idx: int):
+        state = dict(robots=dict(), obj=None)
+        env_idx = int(env_idx)
+        for side, robot in self.robots.items():
+            state['robots'][side] = robot.dof_pos[env_idx].clone()
+        if self.object is not None:
+            state['obj'] = dict(
+                pos=self.object.root_pos[env_idx].clone(),
+                quat=self.object.root_quat[env_idx].clone(),
+                dof=self.object.dof_pos[env_idx].clone(),
+            )
+        return state
+
+    def _restore_env_state(self, env_idx: int, state: Dict):
+        env_idx = int(env_idx)
+        for side, robot in self.robots.items():
+            if side not in state['robots']:
+                continue
+            target = state['robots'][side]
+            robot.set_joint_position(target[None], env_idxs=[env_idx])
+        if self.object is not None and state.get('obj', None) is not None:
+            obj_state = state['obj']
+            self.object.set_object_state(
+                obj_state['pos'][None],
+                obj_state['quat'][None],
+                obj_state['dof'][None],
+                env_idxs=[env_idx],
+            )
+
+    def _apply_contact_correction_step(self, env_idx: int, vectors: Dict[str, torch.Tensor], step_scale: float):
+        env_idx = int(env_idx)
+        combined_vec = torch.zeros(3, device=self.device)
+        num_vecs = 0
+        for side, vec in vectors.items():
+            robot = self.robots.get(side, None)
+            if robot is None or vec is None:
+                continue
+            wrist_xyz = robot.get_wrist_xyz_joints()
+            if len(wrist_xyz) != 3:
+                continue
+            norm = torch.norm(vec)
+            if norm > 1e-6:
+                direction = vec / norm
+            else:
+                direction = torch.zeros_like(vec)
+            delta = direction * (step_scale * norm)
+            joint_targets = robot.dof_pos[env_idx].clone()
+            for axis_idx, joint_idx in enumerate(wrist_xyz):
+                joint_targets[joint_idx] += delta[axis_idx]
+            robot.set_joint_position(joint_targets[None], env_idxs=[env_idx])
+            combined_vec += vec
+            num_vecs += 1
+        if self.object is not None and num_vecs > 0:
+            avg_vec = combined_vec / max(num_vecs, 1)
+            obj_delta = -avg_vec * (self.valid_grasp_object_move_scale * step_scale)
+            new_pos = self.object.root_pos[env_idx].clone() + obj_delta
+            self.object.set_object_state(
+                new_pos[None],
+                self.object.root_quat[env_idx][None],
+                self.object.dof_pos[env_idx][None],
+                env_idxs=[env_idx],
+            )
+
+    def _optimize_grasp_state(self, env_idx: int, targets: Dict[str, Dict[str, torch.Tensor]]):
+        if len(targets) == 0:
+            return False
+        env_idx = int(env_idx)
+        snapshot = self._snapshot_env_state(env_idx)
+        best_state = snapshot
+        best_error, best_count, _ = self._contact_alignment_error(env_idx, targets)
+        if best_count == 0:
+            self._restore_env_state(env_idx, snapshot)
+            return False
+        if (best_error / max(best_count, 1)) <= self.valid_grasp_contact_thresh:
+            return True
+        for attempt in range(max(1, int(self.valid_grasp_opt_samples))):
+            step_scale = torch.rand(1).item() * max(self.valid_grasp_step_scale, 1e-3)
+            vectors = self._compute_contact_error_vectors(env_idx, targets)
+            self._apply_contact_correction_step(env_idx, vectors, step_scale)
+            new_error, new_count, _ = self._contact_alignment_error(env_idx, targets)
+            if new_count > 0 and new_error < best_error:
+                best_error = new_error
+                best_state = self._snapshot_env_state(env_idx)
+                if (best_error / max(new_count, 1)) <= self.valid_grasp_contact_thresh:
+                    self._restore_env_state(env_idx, best_state)
+                    return True
+            else:
+                self._restore_env_state(env_idx, best_state)
+        self._restore_env_state(env_idx, best_state)
+        return (best_error / max(best_count, 1)) <= self.valid_grasp_contact_thresh
+
+    def _reset_env_to_demo_anchor(self, env_idx: int):
+        env_idx = int(env_idx)
+        self.episode_length_buf[env_idx] = 0
+        self.episode_start_buf[env_idx] = 0
+        self.randomization.on_reset_idx([env_idx])
+        episode_start = self.episode_start_buf[env_idx:env_idx+1]
+        for _, robot in self.robots.items():
+            robot.reset_idx(env_idxs=[env_idx], episode_start=episode_start)
+        for _, obj in self.objects.items():
+            obj.reset_idx(env_idxs=[env_idx], episode_start=episode_start)
+        if self.use_latent_world_model:
+            self.latent_buf[env_idx] = 0.0
          
     def reset(self): 
         # reset all envs

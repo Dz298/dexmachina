@@ -144,6 +144,7 @@ class BaseRobot:
         self.actuated_joints = [joint for joint in all_joints if joint.type in [gs.JOINT_TYPE.REVOLUTE, gs.JOINT_TYPE.PRISMATIC]]
         self.actuated_dof_names = [joint.name for joint in self.actuated_joints]
         self.actuated_dof_idxs = [joint.dof_idx_local for joint in self.actuated_joints]
+        self.link_name_to_local_idx = {link.name: idx for idx, link in enumerate(self.entity.links)}
         self.ndof = len(self.actuated_joints) # NOTE this is NOT necessarily action dim due to mimic joints
         self.wrist_only = robot_cfg.get("wrist_only", False)
         self.wrist_dof_idxs = [joint.dof_idx_local for joint in self.actuated_joints if 'forearm' in joint.name]
