@@ -14,6 +14,7 @@ forcing the latent to carry object-centric information.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import random
 from typing import Tuple, Dict, Optional
 
 
@@ -194,10 +195,12 @@ class LatentWorldModel(nn.Module):
 class WorldModelTrainer:
     """
     Handles world model training alongside PPO.
-    
-    Collects rollout data and trains the world model after each PPO update.
+
+    Dreamer-style: maintains a replay buffer of transitions (FIFO when full),
+    trains on randomly sampled contiguous sequences from the buffer.
+    Buffer is stored on CPU to save GPU memory; only the sampled batch is moved to device.
     """
-    
+
     def __init__(
         self,
         world_model: LatentWorldModel,
@@ -208,6 +211,7 @@ class WorldModelTrainer:
         num_envs: int = 1,
         device: torch.device = torch.device('cuda'),
         eval_only: bool = False,
+        replay_capacity: int = 5000,
     ):
         self.world_model = world_model
         self.optimizer = torch.optim.Adam(world_model.parameters(), lr=lr)
@@ -217,24 +221,24 @@ class WorldModelTrainer:
         self.num_envs = num_envs
         self.device = device
         self.eval_only = eval_only  # if True, only run encoder for latent; no training
-        
-        # Buffers for collecting rollout data
+        self.replay_capacity = replay_capacity
+
+        # Replay buffer (Dreamer-style): list of transitions, FIFO when full. Stored on CPU.
         self.obs_buffer = []
         self.action_buffer = []
         self.object_state_buffer = []
-        
+
         # Running statistics for logging
         self.total_updates = 0
         self.cumulative_loss = 0.0
-        # Last loss dict for synced wandb logging (updated in train_step)
         self.last_loss_dict = None
-    
+
     def reset_buffers(self):
-        """Clear rollout buffers."""
+        """Clear replay buffers."""
         self.obs_buffer = []
         self.action_buffer = []
         self.object_state_buffer = []
-    
+
     def add_transition(
         self,
         obs: torch.Tensor,
@@ -242,60 +246,64 @@ class WorldModelTrainer:
         object_state: torch.Tensor,
     ):
         """
-        Add a transition to the buffer.
-        
+        Add a transition to the replay buffer. Stored on CPU to save GPU memory.
+        When buffer exceeds replay_capacity, oldest transition is dropped (FIFO).
+
         Args:
             obs: (num_envs, obs_dim) - observation without latent
             action: (num_envs, action_dim)
             object_state: (num_envs, object_state_dim)
         """
-        self.obs_buffer.append(obs.detach())
-        self.action_buffer.append(action.detach())
-        self.object_state_buffer.append(object_state.detach())
-        if len(self.obs_buffer) > self.rollout_length:
+        self.obs_buffer.append(obs.detach().cpu())
+        self.action_buffer.append(action.detach().cpu())
+        self.object_state_buffer.append(object_state.detach().cpu())
+        if len(self.obs_buffer) > self.replay_capacity:
             self.obs_buffer.pop(0)
             self.action_buffer.pop(0)
             self.object_state_buffer.pop(0)
-    
+
     def has_enough_data(self) -> bool:
-        """Check if we have enough data for training."""
+        """Check if we have at least one full sequence for training."""
         return len(self.obs_buffer) >= self.rollout_length
-    
+
     def train_step(self) -> Optional[Dict[str, float]]:
         """
-        Train world model on collected rollout data.
-        
+        Train world model on a randomly sampled contiguous sequence from the replay buffer
+        (Dreamer-style: random sampling for diversity).
+
         Returns:
             loss_dict if training happened, None otherwise
         """
         if not self.has_enough_data():
             return None
-        
-        # Stack buffers into sequences and move to model device
-        # Each buffer entry is (num_envs, dim), stack to (num_envs, seq_len, dim)
-        obs_seq = torch.stack(self.obs_buffer[-self.rollout_length:], dim=1).to(self.device)
-        action_seq = torch.stack(self.action_buffer[-self.rollout_length:], dim=1).to(self.device)
-        object_state_seq = torch.stack(self.object_state_buffer[-self.rollout_length:], dim=1).to(self.device)
-        
-        # Compute loss
+
+        n = len(self.obs_buffer)
+        # Sample random start index so we get a contiguous sequence of length rollout_length
+        max_start = n - self.rollout_length
+        start = random.randint(0, max_start) if max_start > 0 else 0
+        end = start + self.rollout_length
+
+        # Build sequence from buffer and move to device
+        obs_seq = torch.stack(self.obs_buffer[start:end], dim=1).to(self.device)
+        action_seq = torch.stack(self.action_buffer[start:end], dim=1).to(self.device)
+        object_state_seq = torch.stack(self.object_state_buffer[start:end], dim=1).to(self.device)
+
         self.world_model.train()
         loss, loss_dict = self.world_model.compute_loss(
             obs_seq, action_seq, object_state_seq,
             recon_weight=self.recon_weight,
             dynamics_weight=self.dynamics_weight,
         )
-        
-        # Update
+
         self.optimizer.zero_grad()
         loss.backward()
-        # Gradient clipping for stability
         torch.nn.utils.clip_grad_norm_(self.world_model.parameters(), max_norm=1.0)
         self.optimizer.step()
-        
+
         self.total_updates += 1
         self.cumulative_loss += loss.item()
         self.last_loss_dict = loss_dict
-        
+
         return loss_dict
     
     @torch.no_grad()

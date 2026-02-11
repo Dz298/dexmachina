@@ -168,8 +168,9 @@ def main():
             rollout_length=args.horizon,
             num_envs=num_envs,
             device=device,
+            replay_capacity=args.wm_replay_capacity,
         )
-        print(f"[INFO] Created latent world model with latent_dim={args.wm_latent_dim}")
+        print(f"[INFO] Created latent world model with latent_dim={args.wm_latent_dim}, replay_capacity={args.wm_replay_capacity}")
     
     env = RlGamesVecEnvWrapper(env, rl_device, clip_obs, clip_actions, use_sil=False, 
                                world_model_trainer=world_model_trainer)
@@ -209,6 +210,7 @@ def main():
             'recon_weight': args.wm_recon_weight,
             'dynamics_weight': args.wm_dynamics_weight,
             'lr': args.wm_lr,
+            'replay_capacity': args.wm_replay_capacity,
         }
     
     run = wandb.init(

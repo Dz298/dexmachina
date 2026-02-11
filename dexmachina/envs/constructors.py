@@ -376,6 +376,8 @@ def get_common_argparser():
                         help='Weight for dynamics prediction loss')
     parser.add_argument('--wm_lr', type=float, default=3e-4,
                         help='Learning rate for world model')
+    parser.add_argument('--wm_replay_capacity', type=int, default=5000,
+                        help='World model replay buffer capacity (steps). Stored on CPU; Dreamer-style random sequence sampling.')
 
     # additional arguments for maniptrans
     parser.add_argument('--maniptrans', '-mpt', action='store_true')

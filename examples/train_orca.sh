@@ -5,8 +5,8 @@ HAND=orca_hand
 CLIP=box-100-230
 
 # Full run with thumb weighting (5000 epochs) + latent world model
-EXP_NAME=hybrid_very_low_gains_both_wm
-python dexmachina/rl/train_rl_games.py -B 3000 -obf -obt --max_epochs 5000 \
+EXP_NAME=hybrid_rand_wm64
+python dexmachina/rl/train_rl_games.py -B 6000 -obf -obt --max_epochs 5000 \
     --actuate_object --retarget_name para --horizon 16 -imw 0.5 --gain_mode all \
     --curr_schedule uniform --wait_epochs 100 --learning_rate 0.0003 \
     --contact_beta 10 --upper_ratios 0.9 0.9 1 --lower_ratios 0.8 0.8 1 \
@@ -16,8 +16,8 @@ python dexmachina/rl/train_rl_games.py -B 3000 -obf -obt --max_epochs 5000 \
     --aux_reset_thres 0 0 0 --curr_rew_thres 0.6 0.01 0.01 0.01 \
     -am hybrid --hybrid_scales 0.1 1.0 --kp_init 80 --kv_init 5 \
     --thumb_weight 4.0 \
-    --use_latent_world_model --wm_latent_dim 32 \
-    --clip $CLIP -imi 0.3 -bc 0.3 -con 10 -ert 0.6 -exp $EXP_NAME --hand $HAND 
+    --clip $CLIP -imi 0.3 -bc 0.3 -con 10 -ert 0.6 -exp $EXP_NAME --hand $HAND \
+    --use_latent_world_model --wm_latent_dim 64 
     
 
 
