@@ -14,26 +14,21 @@ echo "Mode: HEADLESS VIDEO RECORDING (for SSH)"
 echo ""
 
 # Default parameters
-OBJ="box"
+OBJ="ketchup"
+# OBJ="box"
 HAND="orca_hand"
-MAX_STEPS=130  # Longer sequence for better visualization
+START_FRAME=30
+# START_FRAME=130
+MAX_STEPS=100  # Longer sequence for better visualization
 OUTPUT_DIR="outputs/replay"
-OUTPUT_NAME="orca_hand_replay_pd_control.mp4"
+OUTPUT_NAME="${HAND}_${OBJ}_replay_${START_FRAME}_$((START_FRAME+MAX_STEPS)).mp4"
 
-echo "Recording $MAX_STEPS steps to video..."
-echo "Output: $OUTPUT_DIR/$OUTPUT_NAME"
-echo ""
 
 python examples/replay_retargeted_standalone.py \
     --obj "$OBJ" \
-    --hand "$HAND" \
-    --max_steps "$MAX_STEPS" \
-    --record_video \
-    --output_dir "$OUTPUT_DIR" \
-    --output_name "$OUTPUT_NAME" \
-    --fps 30 \
-    --start_frame 100 \
-    "$@"
+    --hand "$HAND" --start_frame "$START_FRAME" --max_steps "$MAX_STEPS" \
+    --VOC --kp 80 --kv 5 \
+    --record_video --output_dir "$OUTPUT_DIR" --output_name "$OUTPUT_NAME" --fps 30 "$@"
 
 echo ""
 echo "==================================================================="

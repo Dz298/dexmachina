@@ -79,23 +79,15 @@ wrist_trans_kp = 100.0  # Conservative to prevent object drops
 wrist_trans_kv = 5.0   # Damping for translation
 force_range = 100.0  # Increased from 50 to allow stronger forces
 
-# # -- low on wrist, high on fingers
-# finger_kp = 100.0  # Tuned from replay gain sweep (coarse mode optimal)
+# finger_kp = 80.0  # Tuned from replay gain sweep (coarse mode optimal)
 # finger_kv = finger_kp ** 0.5 / 2  # kv ≈ sqrt(kp)/2 for critical damping
-# wrist_rot_kp = 50.0  # Tuned for stable wrist control
+# wrist_rot_kp = 300.0  # Tuned for stable wrist control
 # wrist_rot_kv = wrist_rot_kp ** 0.5 / 2    # Matched to kp for damping
-# wrist_trans_kp = 50.0  # Conservative to prevent object drops
+# wrist_trans_kp = 300.0  # Conservative to prevent object drops
 # wrist_trans_kv = wrist_trans_kp ** 0.5 / 2   # Damping for translation
 # force_range = 100.0  # Increased from 50 to allow stronger forces
 
-# # -- very low on both wrist and fingers
-# finger_kp = 5.0  # Tuned from replay gain sweep (coarse mode optimal)
-# finger_kv = finger_kp ** 0.5 / 2  # kv ≈ sqrt(kp)/2 for critical damping
-# wrist_rot_kp = 50.0  # Tuned for stable wrist control
-# wrist_rot_kv = wrist_rot_kp ** 0.5 / 2    # Matched to kp for damping
-# wrist_trans_kp = 50.0  # Conservative to prevent object drops
-# wrist_trans_kv = wrist_trans_kp ** 0.5 / 2   # Damping for translation
-# force_range = 100.0  # Increased from 50 to allow stronger forces
+
 
 ORCA_LEFT_CFG = {
     "urdf_path": get_urdf_path(left_rel_urdf),

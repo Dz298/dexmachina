@@ -160,6 +160,10 @@ def main(args):
                 
                 print(f"  {side} {joint_group}: kp={kp}, kv={kv}, fr={fr} ({len(joint_idxs)} joints)")
     
+    if args.VOC:
+        obj.set_joint_gains(args.kp, args.kv, obj.force_range, env_idxs=[0])
+        print(f"  object: kp={args.kp}, kv={args.kv}, force_range={obj.force_range}")
+    
     # Prepare data - extract from start_frame onwards
     obj_pos = torch.tensor(demo_data['obj_pos'][args.start_frame:args.start_frame+num_steps], device=device)
     obj_quat = torch.tensor(demo_data['obj_quat'][args.start_frame:args.start_frame+num_steps], device=device)
@@ -198,6 +202,24 @@ def main(args):
     }
     print()
     
+    # When object_pd: build per-step target dofs from demo (pos, quat, arti) so VOC can track them
+    object_target_dofs = None
+    if args.VOC:
+        object_target_dofs = []
+        for t in range(num_steps):
+            obj.set_object_state(
+                root_pos=obj_pos[t : t + 1],
+                root_quat=obj_quat[t : t + 1],
+                joint_qpos=obj_arti[t : t + 1],
+                env_idxs=[0],
+            )
+            dofs = obj.entity.get_dofs_position(envs_idx=[0])
+            object_target_dofs.append(dofs.clone() if dofs.dim() > 1 else dofs.unsqueeze(0).clone())
+        object_target_dofs = torch.cat(object_target_dofs, dim=0)  # (num_steps, 1, num_dofs) or (num_steps, num_dofs)
+        if object_target_dofs.dim() == 2:
+            object_target_dofs = object_target_dofs.unsqueeze(1)  # (num_steps, 1, num_dofs)
+        print("Object VOC: target dofs built from demo trajectory")
+    
     # Set initial object state (before replay loop)
     obj.set_object_state(
         root_pos=obj_pos_init,
@@ -223,8 +245,12 @@ def main(args):
     step_iter = tqdm(range(num_steps), desc="Replaying") if args.record_video else range(num_steps)
     
     for step in step_iter:
-        # Object is simulated (not set) - it responds to hand contacts
-        # Only hands follow the exact trajectory
+        # Object: when object_pd, VOC drives it toward demo target; else physics-only
+        if object_target_dofs is not None:
+            obj.entity.control_dofs_position(
+                object_target_dofs[step],
+                envs_idx=[0],
+            )
         
         # Control hand positions using PD controller (not kinematic setting)
         for side in ['left', 'right']:
@@ -306,5 +332,11 @@ if __name__ == '__main__':
                         help='Rotation noise magnitude (radians)')
     parser.add_argument('--start_frame', type=int, default=0,
                         help='Start replay from this frame (matches training clip start)')
+    parser.add_argument('--VOC', action='store_true',
+                        help='Set object joint kp/kv (VOC) from object config')
+    parser.add_argument('--kp', type=float, default=100.0,
+                        help='Object joint kp')
+    parser.add_argument('--kv', type=float, default=10.0,
+                        help='Object joint kv')
     args = parser.parse_args()
     main(args)

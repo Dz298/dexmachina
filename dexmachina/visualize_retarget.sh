@@ -5,7 +5,7 @@
 eval "$(conda shell.bash hook)"
 conda activate dexmachina
 
-OBJ=box
+OBJ=ketchup
 HAND=orca_hand
 SUBJECT=s01
 USE_CLIP=01
@@ -21,7 +21,7 @@ python visualize_hand_headless.py \
     --hand $HAND \
     --subject $SUBJECT \
     --use_clip $USE_CLIP \
-    --num_frames 120 \
+    --num_frames 0 \
     --fps 30 \
     --output_dir visualization_output \
     --output_name ${HAND}_${OBJ}_retargeted.mp4 \
