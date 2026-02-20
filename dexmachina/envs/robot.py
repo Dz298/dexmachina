@@ -882,6 +882,18 @@ class BaseRobot:
                 if word in joint.name:
                     idxs.append(joint.dof_idx_local)
         return idxs
+
+    def get_finger_joint_groups(self):
+        finger_names = ['thumb', 'index', 'middle', 'ring', 'pinky']
+        groups = {name: [] for name in finger_names}
+        for joint in self.actuated_joints:
+            if 'forearm' in joint.name:
+                continue
+            for finger in finger_names:
+                if finger in joint.name:
+                    groups[finger].append(joint.dof_idx_local)
+                    break
+        return groups
     
     def get_control_force(self):
         return self.entity.get_dofs_control_force(dofs_idx_local=self.actuated_dof_idxs)

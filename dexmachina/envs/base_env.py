@@ -5,7 +5,7 @@ import genesis as gs
 from dexmachina.envs.robot import BaseRobot
 from dexmachina.envs.object import ArticulatedObject
 from dexmachina.envs.rewards import RewardModule
-from dexmachina.envs.math_utils import matrix_from_quat
+from dexmachina.envs.math_utils import matrix_from_quat, quat_mul, quat_conjugate
 from dexmachina.envs.contacts import get_filtered_contacts
 from dexmachina.envs.randomizations import RandomizationModule
 from dexmachina.envs.curriculum import Curriculum 
@@ -143,12 +143,45 @@ def get_env_cfg(
         "enforce_valid_rand_init_grasp": False,
         "valid_grasp_min_contacts": 1,
         "valid_grasp_contact_thresh": 0.01,
-        "valid_grasp_resample_attempts": 8,
+        "valid_grasp_max_contact_err_per_link": 0.08,  # guardrail: reject if mean contact error (m) per link exceeds this
         "valid_grasp_require_both_hands": False,
-        "valid_grasp_opt_samples": 12,
-        "valid_grasp_step_scale": 0.4,
-        "valid_grasp_object_move_scale": 0.5,
+        "valid_grasp_sample_iters": 2,
+        "valid_grasp_sample_count": 32,
+        "valid_grasp_sample_std": 0.02,
+        "valid_grasp_close_bias": 0.01,
+        "valid_grasp_guided_gain": 0.08,
+        "valid_grasp_guided_abd_gain": 0.03,
+        "valid_grasp_settle_steps": 8,
+        "valid_grasp_slip_weight": 2.0,
+        "valid_grasp_vel_weight": 0.5,
+        "valid_grasp_ang_vel_weight": 0.25,
+        "valid_grasp_opposition_weight": 0.0,  # reward weight on thumb-vs-fingers opposition score (higher is better)
+        "valid_grasp_functional_opposition_min": 0.15,  # minimum thumb-vs-fingers opposition score; <=0 disables
+        "valid_grasp_hold_max_drop": -1.0,  # hard gate (m) on free-hold drop; <=0 disables
+        "valid_grasp_hold_max_vel": -1.0,   # hard gate (m/s) on free-hold max linear vel; <=0 disables
+        "valid_grasp_hold_max_ang_vel": -1.0,  # hard gate (rad/s) on free-hold max angular vel; <=0 disables
+        "valid_grasp_hold_ignore_steps": 0,  # ignore first N unpinned hold steps when measuring stability
+        "valid_grasp_contact_persistence_min": 0.0,  # require final contact persistence ratio during hold; <=0 disables
+        "valid_grasp_compliance_steps": 50,  # virtual 6D spring steps after unpinning (stiffness decays 1->0)
+        "valid_grasp_contact_bonus": 0.01,
+        "valid_grasp_refine_mode": "sampling",  # one of: sampling, ik, virtual_force
+        "valid_grasp_use_ik": False,
+        "valid_grasp_ik_iters": 4,
+        "valid_grasp_ik_damping": 1e-3,
+        "valid_grasp_ik_eps": 2e-3,
+        "valid_grasp_ik_step_clip": 0.12,
+        "valid_grasp_ik_close_bias": 0.02,
+        "valid_grasp_vf_attract_steps": 20,   # steps of attract+settle (object pinned)
+        "valid_grasp_vf_hold_steps": 10,      # steps of free-physics validation (slip measure)
+        "valid_grasp_vf_anneal_probe_hold_steps": 5,  # short hold probe per anneal step for stability-aware selection
+        "valid_grasp_vf_close_bias": 0.02,
+        "valid_grasp_vf_squeeze_torque": 0.0,  # constant close-direction torque bias during pinned close-settle
+        "valid_grasp_vf_attract_gain": 0.5,   # J^T attraction gain during pre-tension phase
+        "valid_grasp_vf_attract_dq_clip": 0.03,  # per-step joint delta clip for J^T attraction
+        "valid_grasp_vf_soft_unpin_steps": 50,  # steps with decreasing gravity compensation after pre-tension
+        "valid_grasp_gravity_ramp_steps": 0,  # ramp down gravity compensation over N unpinned hold steps
         "valid_grasp_fallback_to_zero": True,
+        "valid_grasp_debug": False,
         "env_spacing": ENV_SPACING,
         "n_envs_per_row": None, # this will default to grid layout 
         "chunk_ep_length": -1,#chunk the episode length
@@ -191,12 +224,49 @@ class BaseEnv:
         self.enforce_valid_rand_init_grasp = env_cfg.get('enforce_valid_rand_init_grasp', False)
         self.valid_grasp_min_contacts = env_cfg.get('valid_grasp_min_contacts', 1)
         self.valid_grasp_contact_thresh = env_cfg.get('valid_grasp_contact_thresh', 0.01)
-        self.valid_grasp_resample_attempts = env_cfg.get('valid_grasp_resample_attempts', 8)
+        self.valid_grasp_max_contact_err_per_link = env_cfg.get('valid_grasp_max_contact_err_per_link', 0.08)
         self.valid_grasp_require_both_hands = env_cfg.get('valid_grasp_require_both_hands', False)
-        self.valid_grasp_opt_samples = env_cfg.get('valid_grasp_opt_samples', 12)
-        self.valid_grasp_step_scale = env_cfg.get('valid_grasp_step_scale', 0.4)
-        self.valid_grasp_object_move_scale = env_cfg.get('valid_grasp_object_move_scale', 0.5)
+        self.valid_grasp_sample_iters = env_cfg.get('valid_grasp_sample_iters', 2)
+        self.valid_grasp_sample_count = env_cfg.get('valid_grasp_sample_count', 32)
+        self.valid_grasp_sample_std = env_cfg.get('valid_grasp_sample_std', 0.02)
+        self.valid_grasp_close_bias = env_cfg.get('valid_grasp_close_bias', 0.01)
+        self.valid_grasp_guided_gain = env_cfg.get('valid_grasp_guided_gain', 0.08)
+        self.valid_grasp_guided_abd_gain = env_cfg.get('valid_grasp_guided_abd_gain', 0.03)
+        self.valid_grasp_settle_steps = env_cfg.get('valid_grasp_settle_steps', 8)
+        self.valid_grasp_slip_weight = env_cfg.get('valid_grasp_slip_weight', 2.0)
+        self.valid_grasp_vel_weight = env_cfg.get('valid_grasp_vel_weight', 0.5)
+        self.valid_grasp_ang_vel_weight = env_cfg.get('valid_grasp_ang_vel_weight', 0.25)
+        self.valid_grasp_opposition_weight = env_cfg.get('valid_grasp_opposition_weight', 0.0)
+        self.valid_grasp_functional_opposition_min = env_cfg.get('valid_grasp_functional_opposition_min', 0.15)
+        self.valid_grasp_hold_max_drop = env_cfg.get('valid_grasp_hold_max_drop', -1.0)
+        self.valid_grasp_hold_max_vel = env_cfg.get('valid_grasp_hold_max_vel', -1.0)
+        self.valid_grasp_hold_max_ang_vel = env_cfg.get('valid_grasp_hold_max_ang_vel', -1.0)
+        self.valid_grasp_hold_ignore_steps = env_cfg.get('valid_grasp_hold_ignore_steps', 0)
+        self.valid_grasp_contact_persistence_min = env_cfg.get('valid_grasp_contact_persistence_min', 0.0)
+        self.valid_grasp_compliance_steps = env_cfg.get('valid_grasp_compliance_steps', 50)
+        self.valid_grasp_contact_bonus = env_cfg.get('valid_grasp_contact_bonus', 0.01)
+        self.valid_grasp_refine_mode = env_cfg.get('valid_grasp_refine_mode', None)
+        self.valid_grasp_use_ik = env_cfg.get('valid_grasp_use_ik', False)
+        self.valid_grasp_ik_iters = env_cfg.get('valid_grasp_ik_iters', 4)
+        self.valid_grasp_ik_damping = env_cfg.get('valid_grasp_ik_damping', 1e-3)
+        self.valid_grasp_ik_eps = env_cfg.get('valid_grasp_ik_eps', 2e-3)
+        self.valid_grasp_ik_step_clip = env_cfg.get('valid_grasp_ik_step_clip', 0.12)
+        self.valid_grasp_ik_close_bias = env_cfg.get('valid_grasp_ik_close_bias', 0.02)
+        self.valid_grasp_vf_close_bias = env_cfg.get('valid_grasp_vf_close_bias', 0.02)
+        self.valid_grasp_vf_attract_steps = env_cfg.get('valid_grasp_vf_attract_steps', 20)
+        self.valid_grasp_vf_hold_steps = env_cfg.get('valid_grasp_vf_hold_steps', 10)
+        self.valid_grasp_vf_anneal_probe_hold_steps = env_cfg.get('valid_grasp_vf_anneal_probe_hold_steps', 5)
+        self.valid_grasp_vf_squeeze_torque = env_cfg.get('valid_grasp_vf_squeeze_torque', 0.0)
+        self.valid_grasp_vf_attract_gain = env_cfg.get('valid_grasp_vf_attract_gain', 0.5)
+        self.valid_grasp_vf_attract_dq_clip = env_cfg.get('valid_grasp_vf_attract_dq_clip', 0.03)
+        self.valid_grasp_vf_soft_unpin_steps = env_cfg.get('valid_grasp_vf_soft_unpin_steps', 50)
+        self.valid_grasp_gravity_ramp_steps = env_cfg.get('valid_grasp_gravity_ramp_steps', 0)
         self.valid_grasp_fallback_to_zero = env_cfg.get('valid_grasp_fallback_to_zero', True)
+        self.valid_grasp_debug = env_cfg.get('valid_grasp_debug', False)
+        if self.valid_grasp_refine_mode is None:
+            self.valid_grasp_refine_mode = 'ik' if self.valid_grasp_use_ik else 'sampling'
+        self._warned_no_active_contact_finger = False
+        self._last_settle_stats = dict()
 
         # Latent world model config
         self.use_latent_world_model = env_cfg.get('use_latent_world_model', False)
@@ -394,6 +464,8 @@ class BaseEnv:
     def _setup_contact_link_metadata(self):
         """Map demo contact link ordering to robot link indices for each hand."""
         self.contact_link_meta = dict()
+        self.thumb_indices = dict()
+        self.finger_indices = dict()
         if len(self.robots) == 0:
             return
         for side, robot in self.robots.items():
@@ -402,13 +474,20 @@ class BaseEnv:
             if len(link_names) == 0:
                 continue
             link_idxs = []
+            thumb_link_idxs = []
+            finger_link_idxs = []
             missing = []
             for name in link_names:
                 idx = robot.link_name_to_local_idx.get(name)
                 if idx is None:
                     missing.append(name)
                 else:
-                    link_idxs.append(idx)
+                    link_idxs.append(int(idx))
+                    lname = name.lower()
+                    if "thumb" in lname:
+                        thumb_link_idxs.append(int(idx))
+                    else:
+                        finger_link_idxs.append(int(idx))
             if len(link_idxs) == 0 or len(missing) > 0:
                 if len(missing) > 0:
                     print(f"[valid-grasp] Missing collision links for {side}: {missing}")
@@ -418,6 +497,14 @@ class BaseEnv:
                 link_local_idxs=torch.tensor(link_idxs, dtype=torch.long, device=self.device),
                 num_links=len(link_idxs),
             )
+            if len(thumb_link_idxs) > 0:
+                self.thumb_indices[side] = torch.tensor(
+                    sorted(list(set(thumb_link_idxs))), dtype=torch.long, device=self.device
+                )
+            if len(finger_link_idxs) > 0:
+                self.finger_indices[side] = torch.tensor(
+                    sorted(list(set(finger_link_idxs))), dtype=torch.long, device=self.device
+                )
             
     def build_scene(self):
         env_cfg = self.env_cfg
@@ -494,7 +581,6 @@ class BaseEnv:
         self.num_privileged_obs = None
         self.num_actions = self.action_dim # need for rsl
         self._demo_contact_cache = dict()
-        self.contact_link_meta = dict()
         self.initialize_value_buffers()
         
         # # NOTE! seems like scene must be built first
@@ -1152,6 +1238,7 @@ class BaseEnv:
 
         if rand_init_mask is not None:
             self._ensure_valid_rand_init_grasp(env_idxs_list, rand_init_mask)
+            self._zero_object_velocity_envs(env_idxs_list)
 
         self.last_actions[env_idxs] = 0.0
         
@@ -1182,7 +1269,21 @@ class BaseEnv:
         # Reset latent buffer for world model
         if self.use_latent_world_model:
             self.latent_buf[env_idxs] = 0.0  
-    
+
+    def _zero_object_velocity_envs(self, env_idxs):
+        """Hard reset object velocities for selected envs."""
+        if self.object is None:
+            return
+        if isinstance(env_idxs, torch.Tensor):
+            env_idxs = env_idxs.tolist()
+        env_idxs = [int(i) for i in env_idxs]
+        if len(env_idxs) == 0:
+            return
+        self.object.entity.zero_all_dofs_velocity(envs_idx=env_idxs)
+        self.object.root_lin_vel[env_idxs, :] = 0.0
+        self.object.root_ang_vel[env_idxs, :] = 0.0
+        self.object.dof_vel[env_idxs, :] = 0.0
+
     def _ensure_valid_rand_init_grasp(self, env_idxs_list, rand_mask):
         """Adjust invalid random initializations via contact-aware sampling."""
         if (
@@ -1218,12 +1319,20 @@ class BaseEnv:
             if avg_err > self.valid_grasp_contact_thresh:
                 invalid_envs.append(env_idx)
         if len(invalid_envs) == 0:
+            self._zero_object_velocity_envs(candidate_envs)
+            if self.valid_grasp_debug:
+                print(f"[valid-grasp] no invalid envs among candidates={candidate_envs}")
             return
+        if self.valid_grasp_debug:
+            print(f"[valid-grasp] invalid envs={invalid_envs} from candidates={candidate_envs}")
         for env_idx in invalid_envs:
             targets = targets_map.get(env_idx, dict())
             success = self._optimize_grasp_state(env_idx, targets)
             if not success and self.valid_grasp_fallback_to_zero:
+                if self.valid_grasp_debug:
+                    print(f"[valid-grasp] env={env_idx} optimize failed, fallback_to_zero=True")
                 self._reset_env_to_demo_anchor(env_idx)
+        self._zero_object_velocity_envs(candidate_envs)
 
     def _get_demo_contact_targets_for_env(self, env_idx: int):
         targets = dict()
@@ -1256,13 +1365,9 @@ class BaseEnv:
     def _evaluate_grasp_quality(self, env_idx: int, targets: Dict[str, Dict[str, torch.Tensor]]):
         if len(targets) == 0:
             return self._keypoint_grasp_distance(env_idx)
-        error_sum, count, side_counts = self._contact_alignment_error(env_idx, targets)
+        error_sum, count, _ = self._contact_alignment_error(env_idx, targets)
         if count == 0:
             return self._keypoint_grasp_distance(env_idx)
-        if self.valid_grasp_require_both_hands and len(side_counts) > 1:
-            sides_with_contact = sum(1 for v in side_counts.values() if v > 0)
-            if sides_with_contact < len(side_counts):
-                return float('inf')
         if count < self.valid_grasp_min_contacts:
             return float('inf')
         return error_sum / max(count, 1)
@@ -1321,26 +1426,1590 @@ class BaseEnv:
                 total_count += count
         return total_error, total_count, side_counts
 
-    def _compute_contact_error_vectors(self, env_idx: int, targets: Dict[str, Dict[str, torch.Tensor]]):
-        vectors = dict()
+    def _get_active_contact_fingers(self, targets: Dict[str, Dict[str, torch.Tensor]]):
+        active = dict()
+        finger_names = ['thumb', 'index', 'middle', 'ring', 'pinky']
         for side, target in targets.items():
             meta = self.contact_link_meta.get(side, None)
             robot = self.robots.get(side, None)
             if meta is None or robot is None:
                 continue
-            link_idxs = meta['link_local_idxs']
-            link_pos = robot.entity.get_links_pos()
-            env_link_pos = link_pos[env_idx, link_idxs]
-            pos_expanded = env_link_pos.unsqueeze(0)
-            diff = target['positions'] - pos_expanded
-            mask = target['valid'].unsqueeze(-1)
-            masked = torch.where(mask, diff, torch.zeros_like(diff))
-            count = target['valid'].sum().item()
-            if count == 0:
-                vectors[side] = torch.zeros(3, device=self.device)
-            else:
-                vectors[side] = masked.sum(dim=(0,1)) / max(count, 1)
-        return vectors
+            link_names = meta.get('link_names', [])
+            link_idxs = meta.get('link_local_idxs', None)
+            if len(link_names) == 0:
+                continue
+            valid_any = target['valid']
+            active_fingers = set()
+            collision_groups = robot.get_collision_groups()
+            group_to_finger = {
+                1: 'thumb',
+                2: 'index',
+                3: 'middle',
+                4: 'ring',
+                5: 'pinky',
+            }
+            for link_i, link_name in enumerate(link_names):
+                if not valid_any[:, link_i].any().item():
+                    continue
+                matched = False
+                for finger in finger_names:
+                    if finger in link_name:
+                        active_fingers.add(finger)
+                        matched = True
+                        break
+                if matched:
+                    continue
+                if link_idxs is not None and link_i < len(link_idxs):
+                    local_idx = int(link_idxs[link_i].item())
+                    group_id = collision_groups.get(local_idx, None)
+                    finger = group_to_finger.get(group_id, None)
+                    if finger is not None:
+                        active_fingers.add(finger)
+            if len(active_fingers) > 0:
+                active[side] = list(sorted(active_fingers))
+        return active
+
+    def _compute_finger_contact_dirs(self, env_idx: int, targets: Dict[str, Dict[str, torch.Tensor]]):
+        dirs = dict()
+        finger_names = ['thumb', 'index', 'middle', 'ring', 'pinky']
+        for side, target in targets.items():
+            meta = self.contact_link_meta.get(side, None)
+            robot = self.robots.get(side, None)
+            if meta is None or robot is None:
+                continue
+            link_names = meta.get('link_names', [])
+            link_idxs = meta.get('link_local_idxs', None)
+            if len(link_names) == 0 or link_idxs is None or len(link_names) != len(link_idxs):
+                continue
+            env_link_pos = robot.entity.get_links_pos()[env_idx, link_idxs]
+            side_dirs = {name: torch.zeros(3, device=self.device) for name in finger_names}
+            side_counts = {name: 0 for name in finger_names}
+            for part_idx in range(target['positions'].shape[0]):
+                valid_mask = target['valid'][part_idx]
+                if valid_mask.sum() == 0:
+                    continue
+                diffs = target['positions'][part_idx] - env_link_pos
+                for link_i, link_name in enumerate(link_names):
+                    if not valid_mask[link_i]:
+                        continue
+                    finger = None
+                    for f in finger_names:
+                        if f in link_name:
+                            finger = f
+                            break
+                    if finger is None:
+                        continue
+                    side_dirs[finger] += diffs[link_i]
+                    side_counts[finger] += 1
+            for finger in finger_names:
+                if side_counts[finger] > 0:
+                    side_dirs[finger] = side_dirs[finger] / float(side_counts[finger])
+            dirs[side] = side_dirs
+        return dirs
+
+    def _map_link_to_finger(self, robot, link_name: str, local_idx: int):
+        for finger in ['thumb', 'index', 'middle', 'ring', 'pinky']:
+            if finger in link_name:
+                return finger
+        group_to_finger = {1: 'thumb', 2: 'index', 3: 'middle', 4: 'ring', 5: 'pinky'}
+        group_id = robot.get_collision_groups().get(int(local_idx), None)
+        return group_to_finger.get(group_id, None)
+
+    def _build_finger_contact_problem(self, env_idx: int, targets: Dict[str, Dict[str, torch.Tensor]]):
+        problem = dict()
+        for side, target in targets.items():
+            meta = self.contact_link_meta.get(side, None)
+            robot = self.robots.get(side, None)
+            if meta is None or robot is None:
+                continue
+            link_names = meta.get('link_names', [])
+            link_idxs = meta.get('link_local_idxs', None)
+            if len(link_names) == 0 or link_idxs is None:
+                continue
+            finger_groups = robot.get_finger_joint_groups()
+            side_problem = dict()
+            for link_i, link_name in enumerate(link_names):
+                valid = target['valid'][:, link_i]
+                if not valid.any().item():
+                    continue
+                tgt_pos = target['positions'][:, link_i, :][valid].mean(dim=0)
+                local_idx = int(link_idxs[link_i].item())
+                finger = self._map_link_to_finger(robot, link_name, local_idx)
+                if finger is None:
+                    continue
+                joint_idxs = finger_groups.get(finger, [])
+                if len(joint_idxs) == 0:
+                    continue
+                if finger not in side_problem:
+                    side_problem[finger] = dict(
+                        joint_idxs=joint_idxs,
+                        link_local_idxs=[],
+                        target_positions=[],
+                    )
+                side_problem[finger]['link_local_idxs'].append(local_idx)
+                side_problem[finger]['target_positions'].append(tgt_pos)
+            if len(side_problem) > 0:
+                problem[side] = side_problem
+        return problem
+
+    def _build_side_contact_problem(self, env_idx: int, targets: Dict[str, Dict[str, torch.Tensor]]):
+        problem = dict()
+        for side, target in targets.items():
+            meta = self.contact_link_meta.get(side, None)
+            robot = self.robots.get(side, None)
+            if meta is None or robot is None:
+                continue
+            link_names = meta.get('link_names', [])
+            link_idxs = meta.get('link_local_idxs', None)
+            if len(link_names) == 0 or link_idxs is None:
+                continue
+            finger_groups = robot.get_finger_joint_groups()
+            link_local_idxs = []
+            target_positions = []
+            active_fingers = set()
+            for link_i, link_name in enumerate(link_names):
+                valid = target['valid'][:, link_i]
+                if not valid.any().item():
+                    continue
+                local_idx = int(link_idxs[link_i].item())
+                tgt_pos = target['positions'][:, link_i, :][valid].mean(dim=0)
+                link_local_idxs.append(local_idx)
+                target_positions.append(tgt_pos)
+                # finger mapping only needed for joint selection, not for IK targets
+                finger = self._map_link_to_finger(robot, link_name, local_idx)
+                if finger is not None:
+                    active_fingers.add(finger)
+            if len(link_local_idxs) == 0:
+                continue
+            joint_set = set()
+            for finger in active_fingers:
+                for j in finger_groups.get(finger, []):
+                    joint_set.add(int(j))
+            # Include wrist joints (forearm tx/ty/tz + roll/pitch/yaw) so IK can
+            # reposition the hand globally, not just flex individual fingers.
+            for j in robot.wrist_dof_idxs:
+                joint_set.add(int(j))
+            if len(joint_set) == 0:
+                continue
+            problem[side] = dict(
+                joint_idxs=sorted(list(joint_set)),
+                link_local_idxs=link_local_idxs,
+                target_positions=torch.stack(target_positions, dim=0),
+                active_fingers=active_fingers,
+            )
+        return problem
+
+    def _numeric_finger_jacobian(self, env_idx: int, robot, joint_targets: torch.Tensor, joint_idxs, link_local_idxs):
+        env_idx = int(env_idx)
+        eps = float(self.valid_grasp_ik_eps)
+        robot.set_joint_position(joint_targets[None], env_idxs=[env_idx])
+        base = robot.entity.get_links_pos()[env_idx, link_local_idxs]
+        n_res = base.numel()
+        n_dof = len(joint_idxs)
+        J = torch.zeros((n_res, n_dof), device=self.device)
+        for col, dof_idx in enumerate(joint_idxs):
+            perturbed = joint_targets.clone()
+            perturbed[dof_idx] += eps
+            lower = robot.dof_limits[:, 0]
+            upper = robot.dof_limits[:, 1]
+            perturbed = torch.clamp(perturbed, lower, upper)
+            robot.set_joint_position(perturbed[None], env_idxs=[env_idx])
+            pos = robot.entity.get_links_pos()[env_idx, link_local_idxs]
+            J[:, col] = ((pos - base) / eps).reshape(-1)
+        robot.set_joint_position(joint_targets[None], env_idxs=[env_idx])
+        return J, base
+
+    def _numeric_contact_jacobian(self, env_idx: int, robot, joint_targets: torch.Tensor, joint_idxs, link_local_idxs):
+        env_idx = int(env_idx)
+        eps = float(self.valid_grasp_ik_eps)
+        robot.set_joint_position(joint_targets[None], env_idxs=[env_idx])
+        base = robot.entity.get_links_pos()[env_idx, link_local_idxs]
+        n_res = base.numel()
+        n_dof = len(joint_idxs)
+        J = torch.zeros((n_res, n_dof), device=self.device)
+        for col, dof_idx in enumerate(joint_idxs):
+            perturbed = joint_targets.clone()
+            perturbed[dof_idx] += eps
+            lower = robot.dof_limits[:, 0]
+            upper = robot.dof_limits[:, 1]
+            perturbed = torch.clamp(perturbed, lower, upper)
+            robot.set_joint_position(perturbed[None], env_idxs=[env_idx])
+            pos = robot.entity.get_links_pos()[env_idx, link_local_idxs]
+            J[:, col] = ((pos - base) / eps).reshape(-1)
+        robot.set_joint_position(joint_targets[None], env_idxs=[env_idx])
+        return J, base
+
+    def _solve_contact_ik_lm_for_env(self, env_idx: int, targets: Dict[str, Dict[str, torch.Tensor]]):
+        env_idx = int(env_idx)
+        problem = self._build_side_contact_problem(env_idx, targets)
+        if len(problem) == 0:
+            if self.valid_grasp_debug:
+                print(f"[valid-grasp] env={env_idx} LM IK skipped: no side contact problem")
+            return False
+        changed = False
+        for side, side_problem in problem.items():
+            robot = self.robots.get(side, None)
+            if robot is None:
+                continue
+            joint_idxs = side_problem['joint_idxs']
+            link_local_idxs = side_problem['link_local_idxs']
+            target_positions = side_problem['target_positions']
+            q = robot.dof_pos[env_idx].clone()
+            init_res = None
+            for it in range(max(1, int(self.valid_grasp_ik_iters))):
+                J, curr_pos = self._numeric_contact_jacobian(env_idx, robot, q, joint_idxs, link_local_idxs)
+                residual = (target_positions - curr_pos).reshape(-1)
+                res_norm = torch.norm(residual).item()
+                if init_res is None:
+                    init_res = res_norm
+                if res_norm < 1e-4:
+                    break
+                damping = float(self.valid_grasp_ik_damping)
+                A = J.T @ J + damping * torch.eye(J.shape[1], device=self.device)
+                b = J.T @ residual
+                dq = torch.linalg.solve(A, b)
+                dq = torch.clamp(dq, -self.valid_grasp_ik_step_clip, self.valid_grasp_ik_step_clip)
+                if torch.norm(dq).item() < 1e-6:
+                    break
+                q[joint_idxs] += dq
+                lower = robot.dof_limits[:, 0]
+                upper = robot.dof_limits[:, 1]
+                q = torch.clamp(q, lower, upper)
+                changed = True
+            if self.valid_grasp_debug:
+                J, curr_pos = self._numeric_contact_jacobian(env_idx, robot, q, joint_idxs, link_local_idxs)
+                final_res = torch.norm((target_positions - curr_pos).reshape(-1)).item()
+                print(
+                    f"[LM-IK] env={env_idx} {side}: iters={it+1} "
+                    f"res {init_res:.4f}->{final_res:.4f} n_joints={len(joint_idxs)}"
+                )
+            if self.valid_grasp_ik_close_bias > 0:
+                name_by_idx = {idx: name for idx, name in zip(robot.actuated_dof_idxs, robot.actuated_dof_names)}
+                for dof_idx in joint_idxs:
+                    lname = name_by_idx.get(dof_idx, "").lower()
+                    if "abd" in lname or "spread" in lname or "forearm" in lname:
+                        continue
+                    q[dof_idx] += self.valid_grasp_ik_close_bias
+                lower = robot.dof_limits[:, 0]
+                upper = robot.dof_limits[:, 1]
+                q = torch.clamp(q, lower, upper)
+            robot.set_joint_position(q[None], env_idxs=[env_idx])
+        return changed
+
+    def _solve_contact_ik_for_env(self, env_idx: int, targets: Dict[str, Dict[str, torch.Tensor]]):
+        env_idx = int(env_idx)
+        problem = self._build_finger_contact_problem(env_idx, targets)
+        if len(problem) == 0:
+            if self.valid_grasp_debug:
+                print(f"[valid-grasp] env={env_idx} IK skipped: no finger contact problem")
+            return False
+        changed = False
+        for side, side_problem in problem.items():
+            robot = self.robots.get(side, None)
+            if robot is None:
+                continue
+            for finger, data in side_problem.items():
+                joint_idxs = data['joint_idxs']
+                link_local_idxs = data['link_local_idxs']
+                target_positions = torch.stack(data['target_positions'], dim=0)
+                q = robot.dof_pos[env_idx].clone()
+                for _ in range(max(1, int(self.valid_grasp_ik_iters))):
+                    J, curr_pos = self._numeric_finger_jacobian(env_idx, robot, q, joint_idxs, link_local_idxs)
+                    residual = (target_positions - curr_pos).reshape(-1)
+                    if torch.norm(residual).item() < 1e-4:
+                        break
+                    damping = float(self.valid_grasp_ik_damping)
+                    A = J.T @ J + damping * torch.eye(J.shape[1], device=self.device)
+                    b = J.T @ residual
+                    dq = torch.linalg.solve(A, b)
+                    dq = torch.clamp(dq, -self.valid_grasp_ik_step_clip, self.valid_grasp_ik_step_clip)
+                    if torch.norm(dq).item() < 1e-6:
+                        break
+                    q[joint_idxs] += dq
+                    lower = robot.dof_limits[:, 0]
+                    upper = robot.dof_limits[:, 1]
+                    q = torch.clamp(q, lower, upper)
+                    changed = True
+                if self.valid_grasp_ik_close_bias > 0:
+                    name_by_idx = {idx: name for idx, name in zip(robot.actuated_dof_idxs, robot.actuated_dof_names)}
+                    for dof_idx in joint_idxs:
+                        lname = name_by_idx.get(dof_idx, "").lower()
+                        if "abd" in lname or "spread" in lname:
+                            continue
+                        q[dof_idx] += self.valid_grasp_ik_close_bias
+                    lower = robot.dof_limits[:, 0]
+                    upper = robot.dof_limits[:, 1]
+                    q = torch.clamp(q, lower, upper)
+                robot.set_joint_position(q[None], env_idxs=[env_idx])
+        return changed
+
+    def _apply_sampled_finger_perturbation(self, env_idx: int, targets: Dict[str, Dict[str, torch.Tensor]]):
+        env_idx = int(env_idx)
+        active = self._get_active_contact_fingers(targets)
+        if len(active) == 0:
+            if not self._warned_no_active_contact_finger:
+                self._warned_no_active_contact_finger = True
+                print("[valid-grasp] no active contact fingers identified; skipping refinement sample")
+            return False
+        finger_dirs = self._compute_finger_contact_dirs(env_idx, targets)
+        for side, fingers in active.items():
+            robot = self.robots.get(side, None)
+            if robot is None:
+                continue
+            finger_groups = robot.get_finger_joint_groups()
+            name_by_idx = {idx: name for idx, name in zip(robot.actuated_dof_idxs, robot.actuated_dof_names)}
+            joint_targets = robot.dof_pos[env_idx].clone()
+            for finger in fingers:
+                joint_idxs = finger_groups.get(finger, [])
+                if len(joint_idxs) == 0:
+                    continue
+                noise = torch.randn(len(joint_idxs), device=self.device) * self.valid_grasp_sample_std
+                bias = torch.zeros_like(noise)
+                contact_dir = finger_dirs.get(side, {}).get(finger, torch.zeros(3, device=self.device))
+                guided_flex = self.valid_grasp_guided_gain * float(contact_dir[2].item())
+                guided_abd = self.valid_grasp_guided_abd_gain * float(contact_dir[0].item())
+                if self.valid_grasp_close_bias > 0:
+                    for i, joint_idx in enumerate(joint_idxs):
+                        jname = name_by_idx.get(joint_idx, "")
+                        lname = jname.lower()
+                        if "abd" in lname or "spread" in lname:
+                            bias[i] = guided_abd
+                            continue
+                        bias[i] = self.valid_grasp_close_bias + guided_flex
+                joint_targets[joint_idxs] += noise + bias
+            lower = robot.dof_limits[:, 0]
+            upper = robot.dof_limits[:, 1]
+            joint_targets = torch.clamp(joint_targets, lower, upper)
+            robot.set_joint_position(joint_targets[None], env_idxs=[env_idx])
+        return True
+
+    def _apply_two_sided_finger_probing(self, env_idx: int, targets: Dict[str, Dict[str, torch.Tensor]], init_obj_z: float):
+        """Try +/- guided perturbations per active finger and keep local improvements."""
+        env_idx = int(env_idx)
+        active = self._get_active_contact_fingers(targets)
+        if len(active) == 0:
+            return False
+        finger_dirs = self._compute_finger_contact_dirs(env_idx, targets)
+        working_state = self._snapshot_env_state(env_idx)
+        working_score, _, _ = self._score_candidate(env_idx, targets, init_obj_z)
+        changed = False
+
+        for side, fingers in active.items():
+            robot = self.robots.get(side, None)
+            if robot is None:
+                continue
+            finger_groups = robot.get_finger_joint_groups()
+            name_by_idx = {idx: name for idx, name in zip(robot.actuated_dof_idxs, robot.actuated_dof_names)}
+            side_dirs = finger_dirs.get(side, {})
+            for finger in fingers:
+                joint_idxs = finger_groups.get(finger, [])
+                if len(joint_idxs) == 0:
+                    continue
+                direction = side_dirs.get(finger, torch.zeros(3, device=self.device))
+                probe_step = torch.zeros(len(joint_idxs), device=self.device)
+                for i, joint_idx in enumerate(joint_idxs):
+                    lname = name_by_idx.get(joint_idx, "").lower()
+                    if "abd" in lname or "spread" in lname:
+                        base = self.valid_grasp_guided_abd_gain * float(direction[0].item())
+                    else:
+                        base = self.valid_grasp_close_bias + self.valid_grasp_guided_gain * float(direction[2].item())
+                    probe_step[i] = max(abs(base), self.valid_grasp_sample_std)
+
+                best_local_score = working_score
+                best_local_state = working_state
+                for sign in (1.0, -1.0):
+                    self._restore_env_state(env_idx, working_state)
+                    joint_targets = robot.dof_pos[env_idx].clone()
+                    noise = torch.randn(len(joint_idxs), device=self.device) * (0.25 * self.valid_grasp_sample_std)
+                    delta = sign * probe_step + noise
+                    joint_targets[joint_idxs] += delta
+                    lower = robot.dof_limits[:, 0]
+                    upper = robot.dof_limits[:, 1]
+                    joint_targets = torch.clamp(joint_targets, lower, upper)
+                    robot.set_joint_position(joint_targets[None], env_idxs=[env_idx])
+                    candidate_score, _, _ = self._score_candidate(env_idx, targets, init_obj_z)
+                    if candidate_score < best_local_score:
+                        best_local_score = candidate_score
+                        best_local_state = self._snapshot_env_state(env_idx)
+
+                if best_local_score < working_score:
+                    working_score = best_local_score
+                    working_state = best_local_state
+                    self._restore_env_state(env_idx, working_state)
+                    changed = True
+
+        self._restore_env_state(env_idx, working_state)
+        return changed
+
+    def _object_root_link_global_idx(self):
+        if self.object is None:
+            return None
+        if len(self.object.entity.links) == 0:
+            return None
+        return int(self.object.entity.links[0].idx)
+
+    def _apply_gravity_compensation_force(self, env_idx: int, alpha: float):
+        """Apply upward external force to smooth object unpinning hand-off."""
+        if self.object is None or self.rigid_solver is None:
+            return
+        if not hasattr(self.rigid_solver, "apply_links_external_force"):
+            return
+        gravity_vec = torch.tensor(self.scene_cfg["sim_options"].gravity, dtype=torch.float32, device=self.device)
+        gravity_norm = float(torch.norm(gravity_vec).item())
+        if gravity_norm <= 1e-6:
+            return
+        alpha = float(np.clip(alpha, 0.0, 1.0))
+        if alpha >= 1.0:
+            return
+        root_link = self._object_root_link_global_idx()
+        if root_link is None:
+            return
+        mass = float(self.object.entity.get_mass())
+        # Apply (1-alpha) * (-m*g) as an external force in world frame.
+        comp_force = (-gravity_vec * mass * (1.0 - alpha)).reshape(1, 1, 3)
+        links_idx = torch.tensor([root_link], dtype=torch.long, device=self.device)
+        envs_idx = torch.tensor([int(env_idx)], dtype=torch.long, device=self.device)
+        self.rigid_solver.apply_links_external_force(comp_force, links_idx, envs_idx=envs_idx)
+
+    def _quat_error_rotvec(self, target_quat: torch.Tensor, curr_quat: torch.Tensor):
+        """Quaternion error as axis-angle rotation vector in world frame."""
+        q_err = quat_mul(target_quat[None], quat_conjugate(curr_quat[None]))[0]
+        if q_err[0].item() < 0.0:
+            q_err = -q_err
+        vec = q_err[1:]
+        sin_half = torch.norm(vec)
+        if sin_half.item() < 1e-6:
+            return 2.0 * vec
+        w = torch.clamp(q_err[0], -1.0, 1.0)
+        angle = 2.0 * torch.atan2(sin_half, w)
+        axis = vec / sin_half
+        return axis * angle
+
+    def _apply_compliance_wrench(self, env_idx: int, anchor_pos: torch.Tensor, anchor_quat: torch.Tensor, stiffness_scale: float):
+        """Apply a decaying 6D virtual spring to soften the unpin transition."""
+        if self.object is None or self.rigid_solver is None:
+            return
+        if stiffness_scale <= 0.0:
+            return
+        if not hasattr(self.rigid_solver, "apply_links_external_force"):
+            return
+        if not hasattr(self.rigid_solver, "apply_links_external_torque"):
+            return
+        root_link = self._object_root_link_global_idx()
+        if root_link is None:
+            return
+        mass = float(self.object.entity.get_mass())
+        pos = self.object.root_pos[env_idx]
+        quat = self.object.root_quat[env_idx]
+        lin_vel = self.object.root_lin_vel[env_idx]
+        ang_vel = self.object.root_ang_vel[env_idx]
+        pos_err = anchor_pos - pos
+        rot_err = self._quat_error_rotvec(anchor_quat, quat)
+
+        k_pos = float(stiffness_scale) * (150.0 * mass)
+        d_pos = float(stiffness_scale) * (2.0 * np.sqrt(max(k_pos * mass, 1e-6)))
+        k_rot = float(stiffness_scale) * (35.0 * mass)
+        d_rot = float(stiffness_scale) * (2.0 * np.sqrt(max(k_rot * mass, 1e-6)))
+
+        force = k_pos * pos_err - d_pos * lin_vel
+        torque = k_rot * rot_err - d_rot * ang_vel
+
+        max_force = 200.0 * mass
+        max_torque = 50.0 * mass
+        force_norm = torch.norm(force).item()
+        torque_norm = torch.norm(torque).item()
+        if force_norm > max_force and force_norm > 1e-6:
+            force = force * (max_force / force_norm)
+        if torque_norm > max_torque and torque_norm > 1e-6:
+            torque = torque * (max_torque / torque_norm)
+
+        links_idx = torch.tensor([root_link], dtype=torch.long, device=self.device)
+        envs_idx = torch.tensor([int(env_idx)], dtype=torch.long, device=self.device)
+        self.rigid_solver.apply_links_external_force(
+            force.reshape(1, 1, 3), links_idx, envs_idx=envs_idx
+        )
+        self.rigid_solver.apply_links_external_torque(
+            torque.reshape(1, 1, 3), links_idx, envs_idx=envs_idx
+        )
+
+    def _simulate_settle(
+        self,
+        env_idx: int,
+        hold_targets: Dict[str, torch.Tensor],
+        steps: int,
+        expected_contact_links_by_side: Dict[str, set] = None,
+    ):
+        if steps <= 0:
+            return None, None, None
+        env_idx = int(env_idx)
+        # Ensure stability probe starts from zero object velocity.
+        self._zero_object_velocity_envs([env_idx])
+        ignore_steps = max(0, int(self.valid_grasp_hold_ignore_steps))
+        gravity_ramp_steps = max(0, int(self.valid_grasp_gravity_ramp_steps))
+        compliance_steps = max(0, int(self.valid_grasp_compliance_steps))
+        expected_contact_links_by_side = expected_contact_links_by_side if isinstance(expected_contact_links_by_side, dict) else None
+        compliance_anchor_pos = None
+        compliance_anchor_quat = None
+        if self.object is not None and compliance_steps > 0:
+            compliance_anchor_pos = self.object.root_pos[env_idx].clone()
+            compliance_anchor_quat = self.object.root_quat[env_idx].clone()
+        min_z = None
+        max_vel = None
+        max_ang_vel = None
+        persistence_ratio = 1.0
+        has_persistence_measurement = False
+        for step_i in range(steps):
+            for side, robot in self.robots.items():
+                target = hold_targets.get(side, None)
+                if target is None:
+                    continue
+                robot.control_joint_position(target[None], env_idxs=[env_idx])
+            for _, obj in self.objects.items():
+                obj.step()
+            if compliance_steps > 0 and step_i < compliance_steps and compliance_anchor_pos is not None:
+                if compliance_steps == 1:
+                    stiffness_scale = 1.0
+                else:
+                    stiffness_scale = max(0.0, 1.0 - float(step_i) / float(compliance_steps - 1))
+                self._apply_compliance_wrench(
+                    env_idx, compliance_anchor_pos, compliance_anchor_quat, stiffness_scale
+                )
+            elif gravity_ramp_steps > 0:
+                if gravity_ramp_steps == 1:
+                    alpha = 0.0
+                else:
+                    alpha = min(float(step_i) / float(gravity_ramp_steps - 1), 1.0)
+                self._apply_gravity_compensation_force(env_idx, alpha=alpha)
+            self.scene.step()
+            if self.object is not None:
+                self.object.update_value_buffers()
+                curr_z = float(self.object.root_pos[env_idx, 2].item())
+                vel = float(torch.norm(self.object.root_lin_vel[env_idx]).item())
+                ang_vel = float(torch.norm(self.object.root_ang_vel[env_idx]).item())
+                if step_i >= ignore_steps:
+                    if min_z is None or curr_z < min_z:
+                        min_z = curr_z
+                    if max_vel is None or vel > max_vel:
+                        max_vel = vel
+                    if max_ang_vel is None or ang_vel > max_ang_vel:
+                        max_ang_vel = ang_vel
+                    if expected_contact_links_by_side is not None and len(expected_contact_links_by_side) > 0:
+                        touched = self._get_contact_link_touches_by_side(env_idx)
+                        curr_ratio = self._contact_persistence_ratio(touched, expected_contact_links_by_side)
+                        persistence_ratio = min(persistence_ratio, curr_ratio)
+                        has_persistence_measurement = True
+        self._compute_intermediate_values()
+        if min_z is None and self.object is not None:
+            min_z = float(self.object.root_pos[env_idx, 2].item())
+        if max_vel is None and self.object is not None:
+            max_vel = float(torch.norm(self.object.root_lin_vel[env_idx]).item())
+        if max_ang_vel is None and self.object is not None:
+            max_ang_vel = float(torch.norm(self.object.root_ang_vel[env_idx]).item())
+        if expected_contact_links_by_side is not None and len(expected_contact_links_by_side) > 0 and not has_persistence_measurement:
+            touched = self._get_contact_link_touches_by_side(env_idx)
+            persistence_ratio = self._contact_persistence_ratio(touched, expected_contact_links_by_side)
+        persistence_ok = (
+            self.valid_grasp_contact_persistence_min <= 0.0
+            or persistence_ratio >= float(self.valid_grasp_contact_persistence_min)
+        )
+        self._last_settle_stats[env_idx] = dict(
+            ignore_steps=int(ignore_steps),
+            gravity_ramp_steps=int(gravity_ramp_steps),
+            compliance_steps=int(compliance_steps),
+            persistence_ratio=float(persistence_ratio),
+            persistence_ok=bool(persistence_ok),
+        )
+        return min_z, max_vel, max_ang_vel
+
+    def _get_raw_world_contact_data(self, env_idx: int):
+        """Return raw world contact tensors for one env."""
+        env_idx = int(env_idx)
+        try:
+            n_contacts = int(self.rigid_solver.collider.n_contacts.to_torch(device=self.device)[env_idx].item())
+        except Exception:
+            return None
+        if n_contacts <= 0:
+            return None
+        contact_data = self.rigid_solver.collider.contact_data
+        return dict(
+            n_contacts=n_contacts,
+            link_a=contact_data.link_a.to_torch(device=self.device)[:n_contacts, env_idx].to(dtype=torch.long),
+            link_b=contact_data.link_b.to_torch(device=self.device)[:n_contacts, env_idx].to(dtype=torch.long),
+            normal=contact_data.normal.to_torch(device=self.device)[:n_contacts, env_idx],
+            force=contact_data.force.to_torch(device=self.device)[:n_contacts, env_idx],
+            penetration=contact_data.penetration.to_torch(device=self.device)[:n_contacts, env_idx],
+        )
+
+    def _object_global_link_idxs(self):
+        """Global link ids for the tracked object (use all object links, not only coll_idxs)."""
+        if self.object is None:
+            return torch.zeros((0,), dtype=torch.long, device=self.device)
+        ids = [int(link.idx) for link in self.object.entity.links]
+        if len(ids) == 0:
+            return torch.zeros((0,), dtype=torch.long, device=self.device)
+        return torch.tensor(ids, dtype=torch.long, device=self.device)
+
+    def _local_to_global_link_idxs(self, robot, local_idxs: torch.Tensor):
+        """Convert robot-local link indices to solver-global link indices robustly."""
+        if local_idxs is None or len(local_idxs) == 0:
+            return torch.zeros((0,), dtype=torch.long, device=self.device)
+        ids = []
+        for li in local_idxs.to(dtype=torch.long, device='cpu').tolist():
+            li = int(li)
+            if li < 0 or li >= len(robot.entity.links):
+                continue
+            ids.append(int(robot.entity.links[li].idx))
+        if len(ids) == 0:
+            return torch.zeros((0,), dtype=torch.long, device=self.device)
+        return torch.tensor(ids, dtype=torch.long, device=self.device)
+
+    def _meta_to_global_link_idxs(self, side: str, meta: Dict, valid_mask: torch.Tensor = None):
+        """Resolve contact meta links to solver-global ids, preferring link names over saved idxs."""
+        robot = self.robots.get(side, None)
+        if robot is None or meta is None:
+            return torch.zeros((0,), dtype=torch.long, device=self.device)
+
+        ids = []
+        link_names = meta.get("link_names", [])
+        if len(link_names) > 0:
+            for i, name in enumerate(link_names):
+                if valid_mask is not None:
+                    if i >= valid_mask.shape[0] or not bool(valid_mask[i].item()):
+                        continue
+                local_idx = robot.link_name_to_local_idx.get(name, None)
+                if local_idx is None:
+                    continue
+                if local_idx < 0 or local_idx >= len(robot.entity.links):
+                    continue
+                ids.append(int(robot.entity.links[int(local_idx)].idx))
+        else:
+            local_idxs = meta.get("link_local_idxs", None)
+            if local_idxs is not None and len(local_idxs) > 0:
+                if valid_mask is not None and valid_mask.shape[0] == local_idxs.shape[0]:
+                    local_idxs = local_idxs[valid_mask]
+                return self._local_to_global_link_idxs(robot, local_idxs)
+
+        if len(ids) == 0:
+            return torch.zeros((0,), dtype=torch.long, device=self.device)
+        return torch.tensor(ids, dtype=torch.long, device=self.device)
+
+    def _raw_contact_stats_for_sets(self, raw_contact, obj_link_idxs: torch.Tensor, hand_link_idxs: torch.Tensor):
+        """Count unique object-hand link pairs and touched hand links from raw contact_data."""
+        if raw_contact is None or hand_link_idxs is None or hand_link_idxs.numel() == 0:
+            empty = torch.zeros((0,), dtype=torch.long, device=self.device)
+            return 0, 0, empty
+        link_a = raw_contact["link_a"]
+        link_b = raw_contact["link_b"]
+        obj_link_idxs = obj_link_idxs.to(dtype=torch.long, device=self.device)
+        hand_link_idxs = hand_link_idxs.to(dtype=torch.long, device=self.device)
+        mask_ab = torch.isin(link_a, obj_link_idxs) & torch.isin(link_b, hand_link_idxs)
+        mask_ba = torch.isin(link_b, obj_link_idxs) & torch.isin(link_a, hand_link_idxs)
+        obj_ids = torch.cat([link_a[mask_ab], link_b[mask_ba]], dim=0)
+        hand_ids = torch.cat([link_b[mask_ab], link_a[mask_ba]], dim=0)
+        if obj_ids.numel() == 0:
+            empty = torch.zeros((0,), dtype=torch.long, device=self.device)
+            return 0, 0, empty
+        uniq_pairs = torch.unique(torch.stack([obj_ids, hand_ids], dim=-1), dim=0)
+        touched_hand = torch.unique(hand_ids)
+        return int(uniq_pairs.shape[0]), int(touched_hand.shape[0]), touched_hand
+
+    def _raw_contact_normals_for_sets(self, raw_contact, obj_link_idxs: torch.Tensor, hand_link_idxs: torch.Tensor):
+        """Return object->hand oriented contact normals for selected object/hand links."""
+        if raw_contact is None or hand_link_idxs is None or hand_link_idxs.numel() == 0:
+            return torch.zeros((0, 3), dtype=torch.float32, device=self.device)
+        link_a = raw_contact["link_a"]
+        link_b = raw_contact["link_b"]
+        normal = raw_contact["normal"]
+        obj_link_idxs = obj_link_idxs.to(dtype=torch.long, device=self.device)
+        hand_link_idxs = hand_link_idxs.to(dtype=torch.long, device=self.device)
+        mask_ab = torch.isin(link_a, obj_link_idxs) & torch.isin(link_b, hand_link_idxs)
+        mask_ba = torch.isin(link_b, obj_link_idxs) & torch.isin(link_a, hand_link_idxs)
+        if not mask_ab.any() and not mask_ba.any():
+            return torch.zeros((0, 3), dtype=torch.float32, device=self.device)
+        # Collider normal is geom_a->geom_b. Re-orient to object->hand for both mask directions.
+        normals_ab = normal[mask_ab]
+        normals_ba = -normal[mask_ba]
+        normals = torch.cat([normals_ab, normals_ba], dim=0)
+        return normals
+
+    def _count_actual_contact_pairs(self, env_idx: int, targets: Dict[str, Dict[str, torch.Tensor]] = None):
+        """Count actual object-hand contact pairs from raw world contacts for tracked links."""
+        if self.object is None or len(self.contact_link_meta) == 0:
+            return 0
+        env_idx = int(env_idx)
+        raw_contact = self._get_raw_world_contact_data(env_idx)
+        if raw_contact is None:
+            return 0
+        obj_link_idxs = self._object_global_link_idxs()
+        total = 0
+        for side, meta in self.contact_link_meta.items():
+            valid_mask = None
+            if targets is not None and side in targets:
+                valid_mask = targets[side]["valid"].any(dim=0)
+            global_link_idxs = self._meta_to_global_link_idxs(side, meta, valid_mask=valid_mask)
+            n_pairs, _, _ = self._raw_contact_stats_for_sets(raw_contact, obj_link_idxs, global_link_idxs)
+            total += n_pairs
+        return int(total)
+
+    def _count_actual_contact_pairs_by_side(self, env_idx: int, targets: Dict[str, Dict[str, torch.Tensor]] = None):
+        """Count actual object-hand contact pairs per side from raw world contacts."""
+        if self.object is None or len(self.contact_link_meta) == 0:
+            return {}
+        env_idx = int(env_idx)
+        raw_contact = self._get_raw_world_contact_data(env_idx)
+        if raw_contact is None:
+            return {side: 0 for side in self.contact_link_meta.keys()}
+        obj_link_idxs = self._object_global_link_idxs()
+        side_pairs = {}
+        for side, meta in self.contact_link_meta.items():
+            valid_mask = None
+            if targets is not None and side in targets:
+                valid_mask = targets[side]["valid"].any(dim=0)
+            global_link_idxs = self._meta_to_global_link_idxs(side, meta, valid_mask=valid_mask)
+            n_pairs, _, _ = self._raw_contact_stats_for_sets(raw_contact, obj_link_idxs, global_link_idxs)
+            side_pairs[side] = int(n_pairs)
+        return side_pairs
+
+    def _get_contact_link_touches_by_side(self, env_idx: int, targets: Dict[str, Dict[str, torch.Tensor]] = None):
+        """Return touched hand link ids per side from raw object-hand contacts."""
+        if self.object is None or len(self.contact_link_meta) == 0:
+            return {}
+        env_idx = int(env_idx)
+        raw_contact = self._get_raw_world_contact_data(env_idx)
+        if raw_contact is None:
+            return {side: set() for side in self.contact_link_meta.keys()}
+        obj_link_idxs = self._object_global_link_idxs()
+        touches = {}
+        for side, meta in self.contact_link_meta.items():
+            valid_mask = None
+            if targets is not None and side in targets:
+                valid_mask = targets[side]["valid"].any(dim=0)
+            global_link_idxs = self._meta_to_global_link_idxs(side, meta, valid_mask=valid_mask)
+            _, _, touched = self._raw_contact_stats_for_sets(raw_contact, obj_link_idxs, global_link_idxs)
+            touches[side] = set([int(v) for v in touched.detach().cpu().tolist()])
+        return touches
+
+    def _contact_persistence_ratio(self, touched_by_side: Dict[str, set], expected_by_side: Dict[str, set]):
+        """Ratio of expected touched links that remain touched (min over sides with expectations)."""
+        if not isinstance(expected_by_side, dict) or len(expected_by_side) == 0:
+            return 1.0
+        ratios = []
+        for side, expected in expected_by_side.items():
+            if not isinstance(expected, set) or len(expected) == 0:
+                continue
+            touched = touched_by_side.get(side, set()) if isinstance(touched_by_side, dict) else set()
+            if len(touched) == 0:
+                ratios.append(0.0)
+                continue
+            overlap = len(expected.intersection(touched))
+            ratios.append(float(overlap) / float(max(len(expected), 1)))
+        if len(ratios) == 0:
+            return 1.0
+        return float(min(ratios))
+
+    def _compute_thumb_finger_opposition(self, env_idx: int, targets: Dict[str, Dict[str, torch.Tensor]] = None):
+        """Functional opposition from contact normals: thumb mean vs non-thumb mean."""
+        if self.object is None or len(self.contact_link_meta) == 0:
+            return dict(score=0.0, dot=1.0, thumb_contacts=0, finger_contacts=0)
+        env_idx = int(env_idx)
+        raw_contact = self._get_raw_world_contact_data(env_idx)
+        if raw_contact is None:
+            return dict(score=0.0, dot=1.0, thumb_contacts=0, finger_contacts=0)
+        obj_link_idxs = self._object_global_link_idxs()
+        thumb_normals = []
+        finger_normals = []
+        for side, robot in self.robots.items():
+            thumb_local = self.thumb_indices.get(
+                side, torch.zeros((0,), dtype=torch.long, device=self.device)
+            )
+            finger_local = self.finger_indices.get(
+                side, torch.zeros((0,), dtype=torch.long, device=self.device)
+            )
+            if targets is not None and side in targets and side in self.contact_link_meta:
+                valid_mask = targets[side]["valid"].any(dim=0)
+                meta_local = self.contact_link_meta[side]["link_local_idxs"]
+                if valid_mask.shape[0] == meta_local.shape[0]:
+                    valid_local = set(meta_local[valid_mask].detach().cpu().tolist())
+                    if len(valid_local) > 0:
+                        thumb_local = torch.tensor(
+                            [int(i) for i in thumb_local.detach().cpu().tolist() if int(i) in valid_local],
+                            dtype=torch.long,
+                            device=self.device,
+                        )
+                        finger_local = torch.tensor(
+                            [int(i) for i in finger_local.detach().cpu().tolist() if int(i) in valid_local],
+                            dtype=torch.long,
+                            device=self.device,
+                        )
+            thumb_global = self._local_to_global_link_idxs(robot, thumb_local)
+            finger_global = self._local_to_global_link_idxs(robot, finger_local)
+            n_thumb = self._raw_contact_normals_for_sets(raw_contact, obj_link_idxs, thumb_global)
+            n_finger = self._raw_contact_normals_for_sets(raw_contact, obj_link_idxs, finger_global)
+            if n_thumb.numel() > 0:
+                thumb_normals.append(n_thumb)
+            if n_finger.numel() > 0:
+                finger_normals.append(n_finger)
+        if len(thumb_normals) == 0 or len(finger_normals) == 0:
+            thumb_cnt = int(sum([v.shape[0] for v in thumb_normals])) if len(thumb_normals) > 0 else 0
+            finger_cnt = int(sum([v.shape[0] for v in finger_normals])) if len(finger_normals) > 0 else 0
+            return dict(score=0.0, dot=1.0, thumb_contacts=thumb_cnt, finger_contacts=finger_cnt)
+        thumb = torch.cat(thumb_normals, dim=0)
+        finger = torch.cat(finger_normals, dim=0)
+        thumb_unit = thumb / torch.norm(thumb, dim=-1, keepdim=True).clamp(min=1e-6)
+        finger_unit = finger / torch.norm(finger, dim=-1, keepdim=True).clamp(min=1e-6)
+        thumb_mean = thumb_unit.mean(dim=0)
+        finger_mean = finger_unit.mean(dim=0)
+        thumb_mean = thumb_mean / torch.norm(thumb_mean).clamp(min=1e-6)
+        finger_mean = finger_mean / torch.norm(finger_mean).clamp(min=1e-6)
+        dot = float(torch.clamp(torch.dot(thumb_mean, finger_mean), -1.0, 1.0).item())
+        score = 0.5 * (1.0 - dot)  # 0 when aligned, 1 when perfectly opposing.
+        return dict(
+            score=float(score),
+            dot=dot,
+            thumb_contacts=int(thumb.shape[0]),
+            finger_contacts=int(finger.shape[0]),
+        )
+
+    def _passes_functional_opposition(self, opposition_metrics: Dict):
+        """Functional opposition gate: require thumb and finger contacts with sufficient opposition."""
+        min_score = float(self.valid_grasp_functional_opposition_min)
+        if min_score <= 0.0:
+            return True
+        if not isinstance(opposition_metrics, dict):
+            return False
+        if int(opposition_metrics.get("thumb_contacts", 0)) <= 0:
+            return False
+        if int(opposition_metrics.get("finger_contacts", 0)) <= 0:
+            return False
+        return float(opposition_metrics.get("score", 0.0)) >= min_score
+
+    def _compute_contact_normal_metrics(self, env_idx: int, targets: Dict[str, Dict[str, torch.Tensor]] = None):
+        """Compute force-closure proxies from contact normals: opposition and directional diversity."""
+        if self.object is None or len(self.contact_link_meta) == 0:
+            return dict(opposition_norm=1.0, diversity=0.0, n_contacts=0)
+        env_idx = int(env_idx)
+        raw_contact = self._get_raw_world_contact_data(env_idx)
+        if raw_contact is None:
+            return dict(opposition_norm=1.0, diversity=0.0, n_contacts=0)
+        obj_link_idxs = self._object_global_link_idxs()
+        normals = []
+        for side, meta in self.contact_link_meta.items():
+            valid_mask = None
+            if targets is not None and side in targets:
+                valid_mask = targets[side]["valid"].any(dim=0)
+            global_link_idxs = self._meta_to_global_link_idxs(side, meta, valid_mask=valid_mask)
+            side_normals = self._raw_contact_normals_for_sets(raw_contact, obj_link_idxs, global_link_idxs)
+            if side_normals.numel() > 0:
+                normals.append(side_normals)
+        if len(normals) == 0:
+            return dict(opposition_norm=1.0, diversity=0.0, n_contacts=0)
+        normals = torch.cat(normals, dim=0)
+        n_contacts = int(normals.shape[0])
+        norms = torch.norm(normals, dim=-1, keepdim=True).clamp(min=1e-6)
+        unit = normals / norms
+        mean_vec = unit.mean(dim=0)
+        opposition_norm = float(torch.norm(mean_vec).item())
+        cov = unit.T @ unit / max(float(n_contacts), 1.0)
+        eigvals = torch.linalg.eigvalsh(cov).real
+        lambda_max = float(torch.max(eigvals).item())
+        diversity = float(max(0.0, 1.0 - lambda_max))
+        return dict(opposition_norm=opposition_norm, diversity=diversity, n_contacts=n_contacts)
+
+    def _passes_contact_gate(self, side_pairs: Dict[str, int]):
+        """Contact-count gate: allow single-hand grasps if one side has enough contacts."""
+        return True
+        if not isinstance(side_pairs, dict):
+            return True
+        min_contacts = int(self.valid_grasp_min_contacts)
+        if min_contacts <= 0:
+            return True
+        return max([int(v) for v in side_pairs.values()] + [0]) >= min_contacts
+
+    def _debug_world_contact_pairs(self, env_idx: int, prefix: str = "[VF-close-diag]", max_pairs: int = 10):
+        """Print top world contact pairs (by force norm) with link names."""
+        env_idx = int(env_idx)
+        raw_contact = self._get_raw_world_contact_data(env_idx)
+        if raw_contact is None:
+            print(f"{prefix} env={env_idx}: cannot read world contacts")
+            return
+        n_contacts = int(raw_contact["n_contacts"])
+        link_a = raw_contact["link_a"]
+        link_b = raw_contact["link_b"]
+        force = raw_contact["force"]
+        penetration = raw_contact["penetration"]
+        force_norm = torch.norm(force, dim=-1)
+        topk = min(int(max_pairs), n_contacts)
+        order = torch.argsort(force_norm, descending=True)[:topk]
+
+        link_name_map = {}
+        for obj_name, obj in self.objects.items():
+            for link in obj.entity.links:
+                link_name_map[int(link.idx)] = f"obj:{obj_name}/{link.name}"
+        for side, robot in self.robots.items():
+            for link in robot.entity.links:
+                link_name_map[int(link.idx)] = f"robot:{side}/{link.name}"
+
+        def _name(link_idx: int):
+            return link_name_map.get(link_idx, f"other/link#{link_idx}")
+
+        print(f"{prefix} env={env_idx}: top world contact pairs by |force| (showing {topk}/{n_contacts})")
+        for rank, idx in enumerate(order.tolist()):
+            la = int(link_a[idx].item())
+            lb = int(link_b[idx].item())
+            fn = float(force_norm[idx].item())
+            pen = float(penetration[idx].item())
+            print(
+                f"{prefix} env={env_idx} pair[{rank}] "
+                f"{_name(la)}(id={la}) <-> {_name(lb)}(id={lb}) |force|={fn:.4f} penetration={pen:.6f}"
+            )
+
+    def _debug_contact_diagnostics(self, env_idx: int, targets: Dict[str, Dict[str, torch.Tensor]] = None, prefix: str = "[VF-close-diag]"):
+        """Print why tracked contact pairs are missing (debug-only utility)."""
+        if self.object is None or len(self.contact_link_meta) == 0:
+            print(f"{prefix} env={env_idx}: no object or contact_link_meta")
+            return
+        env_idx = int(env_idx)
+        raw_contact = self._get_raw_world_contact_data(env_idx)
+        world_n_contacts = int(raw_contact["n_contacts"]) if raw_contact is not None else 0
+        if world_n_contacts > 0:
+            self._debug_world_contact_pairs(env_idx, prefix=prefix, max_pairs=8)
+        obj_link_idxs = self._object_global_link_idxs()
+        for side, meta in self.contact_link_meta.items():
+            robot = self.robots.get(side, None)
+            if robot is None:
+                continue
+            local_idxs = meta.get("link_local_idxs", None)
+            if local_idxs is None or len(local_idxs) == 0:
+                print(f"{prefix} env={env_idx} side={side}: no tracked links")
+                continue
+            valid_mask = None
+            if targets is not None and side in targets:
+                valid_mask = targets[side]["valid"].any(dim=0)
+            tracked_global_all = self._meta_to_global_link_idxs(side, meta, valid_mask=None)
+            tracked_global = self._meta_to_global_link_idxs(side, meta, valid_mask=valid_mask)
+            all_global = torch.tensor(robot.coll_idxs_global, device=self.device, dtype=torch.long)
+            tracked_pairs, _, tracked_touched_ids = self._raw_contact_stats_for_sets(
+                raw_contact, obj_link_idxs, tracked_global
+            )
+            all_pairs, _, all_touched_ids = self._raw_contact_stats_for_sets(
+                raw_contact, obj_link_idxs, all_global
+            )
+            tracked_touched = int(torch.isin(tracked_global, tracked_touched_ids).sum().item()) if tracked_global.numel() > 0 else 0
+            all_touched = int(torch.isin(all_global, all_touched_ids).sum().item()) if all_global.numel() > 0 else 0
+
+            target_valid_links = 0
+            missed_names = []
+            tracked_surface_mean_mm = None
+            tracked_surface_min_mm = None
+            all_surface_mean_mm = None
+            all_surface_min_mm = None
+            if len(self.obj_verts) > 0:
+                # Approximate signed distance proxy: min Euclidean distance to sampled object surface verts.
+                tracked_link_pos = robot.entity.get_links_pos()[env_idx:env_idx+1, local_idxs]
+                all_local_idxs = torch.tensor(robot.coll_idxs_local, device=self.device, dtype=torch.long)
+                all_link_pos = robot.entity.get_links_pos()[env_idx:env_idx+1, all_local_idxs]
+                tracked_part_dists = []
+                all_part_dists = []
+                for part in ["top", "bottom"]:
+                    verts = self.obj_verts.get(part, None)
+                    if verts is None:
+                        continue
+                    part_pose = self.object.get_part_pose(part)[env_idx:env_idx+1]
+                    tracked_d = self.compute_closest_vertice_dist_single(verts, tracked_link_pos, part_pose)[0]
+                    all_d = self.compute_closest_vertice_dist_single(verts, all_link_pos, part_pose)[0]
+                    tracked_part_dists.append(tracked_d)
+                    all_part_dists.append(all_d)
+                if len(tracked_part_dists) > 0:
+                    tracked_min_d = torch.stack(tracked_part_dists, dim=0).min(dim=0).values
+                    all_min_d = torch.stack(all_part_dists, dim=0).min(dim=0).values
+                    tracked_surface_mean_mm = float(tracked_min_d.mean().item() * 1000.0)
+                    tracked_surface_min_mm = float(tracked_min_d.min().item() * 1000.0)
+                    all_surface_mean_mm = float(all_min_d.mean().item() * 1000.0)
+                    all_surface_min_mm = float(all_min_d.min().item() * 1000.0)
+            if targets is not None and side in targets:
+                valid_mask = targets[side]["valid"].any(dim=0)
+                target_valid_links = int(valid_mask.sum().item())
+                tracked_link_touch_all = torch.isin(tracked_global_all, tracked_touched_ids)
+                if tracked_link_touch_all.shape[0] == valid_mask.shape[0]:
+                    tracked_link_touch = tracked_link_touch_all
+                    missed = torch.logical_and(valid_mask, torch.logical_not(tracked_link_touch))
+                else:
+                    missed = torch.zeros_like(valid_mask, dtype=torch.bool)
+                link_names = meta.get("link_names", [])
+                missed_idxs = missed.nonzero(as_tuple=False).flatten().tolist()
+                missed_names = [link_names[i] for i in missed_idxs[:6] if i < len(link_names)]
+
+            print(
+                f"{prefix} env={env_idx} side={side}: "
+                f"world_contacts={world_n_contacts} "
+                f"tracked_pairs={tracked_pairs} all_pairs={all_pairs} "
+                f"tracked_links_touch={tracked_touched}/{tracked_global.shape[0]} "
+                f"all_links_touch={all_touched}/{all_global.shape[0]} "
+                f"target_valid_links={target_valid_links} "
+                f"missed_target_links={missed_names} "
+                f"tracked_surface_mm(mean/min)="
+                f"{tracked_surface_mean_mm if tracked_surface_mean_mm is not None else 'na'}/"
+                f"{tracked_surface_min_mm if tracked_surface_min_mm is not None else 'na'} "
+                f"all_surface_mm(mean/min)="
+                f"{all_surface_mean_mm if all_surface_mean_mm is not None else 'na'}/"
+                f"{all_surface_min_mm if all_surface_min_mm is not None else 'na'}"
+            )
+
+    def _simulate_close_settle(self, env_idx: int, targets: Dict[str, Dict[str, torch.Tensor]], steps: int):
+        """Pinned annealed close from IK pose, keeping the best contact-aligned close state.
+
+        Instead of one-shot close bias, we linearly ramp close bias over `steps` and
+        evaluate contact error after each pinned physics step. The best state along
+        this annealing trajectory is restored at the end to avoid over-closing.
+        """
+        if steps <= 0 or self.object is None:
+            return {}
+        env_idx = int(env_idx)
+        close_bias = float(self.valid_grasp_vf_close_bias)
+        squeeze_torque = float(self.valid_grasp_vf_squeeze_torque)
+        probe_hold_steps = max(0, int(self.valid_grasp_vf_anneal_probe_hold_steps))
+        pin_pos = self.object.root_pos[env_idx].clone()
+        pin_quat = self.object.root_quat[env_idx].clone()
+        pin_dof = self.object.dof_pos[env_idx].clone()
+
+        active_fingers = self._get_active_contact_fingers(targets)
+
+        # Base IK pose and active flex joints only (wrist/abduction stay fixed)
+        problem = self._build_side_contact_problem(env_idx, targets)
+        side_meta = {}
+        for side, robot in self.robots.items():
+            side_prob = problem.get(side, None)
+            if side_prob is None:
+                continue
+            
+            joint_idxs = side_prob['joint_idxs']
+            link_local_idxs = side_prob['link_local_idxs']
+            target_positions = side_prob['target_positions']
+
+            q = robot.dof_pos[env_idx].clone()
+            name_by_idx = {idx: name for idx, name in zip(robot.actuated_dof_idxs, robot.actuated_dof_names)}
+            flex_idxs = [
+                int(dof_idx) for dof_idx in joint_idxs
+                if "abd" not in name_by_idx.get(dof_idx, "").lower()
+                and "spread" not in name_by_idx.get(dof_idx, "").lower()
+                and "forearm" not in name_by_idx.get(dof_idx, "").lower()
+            ]
+            if len(flex_idxs) == 0:
+                continue
+            
+            # Calibrate close direction per joint from local contact-error probe.
+            probe_delta = max(0.01, 0.5 * close_bias)
+            close_signs = {}
+            for dof_idx in flex_idxs:
+                base = q.clone()
+                plus = q.clone()
+                minus = q.clone()
+                plus[dof_idx] = torch.clamp(
+                    plus[dof_idx] + probe_delta, robot.dof_limits[dof_idx, 0], robot.dof_limits[dof_idx, 1]
+                )
+                minus[dof_idx] = torch.clamp(
+                    minus[dof_idx] - probe_delta, robot.dof_limits[dof_idx, 0], robot.dof_limits[dof_idx, 1]
+                )
+                robot.set_joint_position(plus[None], env_idxs=[env_idx])
+                plus_err, plus_cnt, _ = self._contact_alignment_error(env_idx, targets)
+                plus_metric = plus_err / max(plus_cnt, 1) if plus_cnt > 0 else float("inf")
+                robot.set_joint_position(minus[None], env_idxs=[env_idx])
+                minus_err, minus_cnt, _ = self._contact_alignment_error(env_idx, targets)
+                minus_metric = minus_err / max(minus_cnt, 1) if minus_cnt > 0 else float("inf")
+                close_signs[dof_idx] = 1.0 if plus_metric <= minus_metric else -1.0
+                robot.set_joint_position(base[None], env_idxs=[env_idx])
+
+            side_meta[side] = dict(
+                robot=robot,
+                base_q=q,
+                flex_idxs=flex_idxs,
+                close_signs=close_signs,
+                joint_idxs=joint_idxs,
+                link_local_idxs=link_local_idxs,
+                target_positions=target_positions,
+            )
+
+        if len(side_meta) == 0:
+            return {}
+
+        def _candidate_metrics():
+            err, cnt, _ = self._contact_alignment_error(env_idx, targets)
+            per_link = err / max(cnt, 1) if cnt > 0 else float("inf")
+            side_contact_pairs = self._count_actual_contact_pairs_by_side(env_idx, targets=targets)
+            contact_pairs = int(sum(side_contact_pairs.values()))
+            contacts_ok = self._passes_contact_gate(side_contact_pairs)
+            opposition = self._compute_thumb_finger_opposition(env_idx, targets=targets)
+            opposition_ok = self._passes_functional_opposition(opposition)
+            stable_ok = True
+            drop = 0.0
+            vel = 0.0
+            ang_vel = 0.0
+            persistence_ratio = 1.0
+            persistence_ok = True
+            if probe_hold_steps > 0:
+                probe_state = self._snapshot_env_state(env_idx)
+                hold_targets = {side: robot.dof_pos[env_idx].clone() for side, robot in self.robots.items()}
+                min_z, max_vel, max_ang_vel = self._simulate_settle(env_idx, hold_targets, probe_hold_steps)
+                settle_stats = self._last_settle_stats.get(env_idx, dict())
+                stable_ok, drop, vel, ang_vel = self._passes_stability_gate(
+                    env_idx,
+                    init_obj_z=pin_pos[2].item(),
+                    min_z=min_z,
+                    max_vel=max_vel,
+                    max_ang_vel=max_ang_vel,
+                    settle_stats=settle_stats,
+                )
+                persistence_ratio = float(settle_stats.get("persistence_ratio", 1.0))
+                persistence_ok = bool(settle_stats.get("persistence_ok", True))
+                self._restore_env_state(env_idx, probe_state)
+                self._compute_intermediate_values()
+            return dict(
+                per_link=per_link,
+                contact_pairs=contact_pairs,
+                side_contact_pairs=side_contact_pairs,
+                contacts_ok=contacts_ok,
+                opposition_ok=opposition_ok,
+                stable=stable_ok,
+                drop=drop,
+                vel=vel,
+                ang_vel=ang_vel,
+                persistence_ratio=persistence_ratio,
+                persistence_ok=persistence_ok,
+                opposition_score=float(opposition["score"]),
+                opposition_dot=float(opposition["dot"]),
+                opposition_thumb_contacts=int(opposition["thumb_contacts"]),
+                opposition_finger_contacts=int(opposition["finger_contacts"]),
+            )
+
+        def _is_better(curr, best):
+            # Prioritize compliance-based stability and functional opposition first.
+            def _rank(v):
+                if v["stable"] and v["contacts_ok"] and v["opposition_ok"]:
+                    return (
+                        3,
+                        float(v["opposition_score"]),
+                        int(v["contact_pairs"]),
+                        -float(v["per_link"]),
+                        -float(v["drop"]),
+                        -float(v["vel"]),
+                        -float(v["ang_vel"]),
+                    )
+                if v["stable"] and v["contacts_ok"]:
+                    return (
+                        2,
+                        float(v["opposition_score"]),
+                        int(v["contact_pairs"]),
+                        -float(v["per_link"]),
+                        -float(v["drop"]),
+                        -float(v["vel"]),
+                        -float(v["ang_vel"]),
+                    )
+                return (
+                    0,
+                    float(v["opposition_score"]),
+                    int(v["contact_pairs"]),
+                    -float(v["per_link"]),
+                    -float(v["drop"]),
+                    -float(v["vel"]),
+                    -float(v["ang_vel"]),
+                )
+            key = _rank(curr)
+            best_key = _rank(best)
+            return key > best_key
+
+        # Keep best close state by hold-stability first, then contact and geometric tie-breaks.
+        self._compute_intermediate_values()
+        best = _candidate_metrics()
+        best_state = self._snapshot_env_state(env_idx)
+        best_step = 0
+        printed_no_contact_diag = False
+
+        for step_i in range(steps):
+            self._compute_intermediate_values()
+            alpha = float(step_i + 1) / float(steps)
+            self.object.set_object_state(
+                pin_pos[None], pin_quat[None], pin_dof[None], env_idxs=[env_idx]
+            )
+            for side, sm in side_meta.items():
+                robot = sm["robot"]
+                target = sm["base_q"].clone()
+                
+                # J^T virtual attraction
+                attract_gain = float(self.valid_grasp_vf_attract_gain)
+                attract_clip = float(self.valid_grasp_vf_attract_dq_clip)
+                if attract_gain > 0 and len(sm['joint_idxs']) > 0:
+                    J, curr_pos = self._numeric_contact_jacobian(
+                        env_idx, robot, target, sm['joint_idxs'], sm['link_local_idxs']
+                    )
+                    residual = (sm['target_positions'] - curr_pos).reshape(-1)
+                    dq_attract = J.T @ residual * attract_gain
+                    dq_attract = torch.clamp(dq_attract, -attract_clip, attract_clip)
+                    target[sm['joint_idxs']] = torch.clamp(
+                        target[sm['joint_idxs']] + dq_attract,
+                        robot.dof_limits[sm['joint_idxs'], 0],
+                        robot.dof_limits[sm['joint_idxs'], 1],
+                    )
+
+                squeeze = []
+                for dof_idx in sm["flex_idxs"]:
+                    sign = sm["close_signs"].get(dof_idx, 1.0)
+                    target[dof_idx] += sign * alpha * close_bias
+                    squeeze.append(sign * squeeze_torque)
+                target = torch.clamp(target, robot.dof_limits[:, 0], robot.dof_limits[:, 1])
+                robot.control_joint_position(target[None], env_idxs=[env_idx])
+                if squeeze_torque > 0.0 and len(squeeze) > 0:
+                    squeeze_t = torch.tensor(squeeze, dtype=torch.float32, device=self.device)
+                    robot.entity.control_dofs_force(
+                        squeeze_t,
+                        dofs_idx_local=sm["flex_idxs"],
+                        envs_idx=[env_idx],
+                    )
+            for _, obj in self.objects.items():
+                obj.step()
+            self.scene.step()
+            self.object.set_object_state(
+                pin_pos[None], pin_quat[None], pin_dof[None], env_idxs=[env_idx]
+            )
+            self._compute_intermediate_values()
+            curr = _candidate_metrics()
+            if self.valid_grasp_debug and curr["contact_pairs"] == 0 and not printed_no_contact_diag:
+                self._debug_contact_diagnostics(
+                    env_idx,
+                    targets=targets,
+                    prefix=f"[VF-close-diag] step={step_i}",
+                )
+                printed_no_contact_diag = True
+            if np.isfinite(curr["per_link"]) and _is_better(curr, best):
+                best = curr
+                best_state = self._snapshot_env_state(env_idx)
+                best_step = step_i + 1
+            if self.valid_grasp_debug and (step_i % 5 == 0 or step_i == steps - 1):
+                print(
+                    f"[VF-close] env={env_idx} step={step_i} alpha={alpha:.2f} "
+                    f"per_link_err={curr['per_link']:.6f} contacts={curr['contact_pairs']} "
+                    f"side_contacts={curr['side_contact_pairs']} contacts_ok={curr['contacts_ok']} "
+                    f"opp_ok={curr['opposition_ok']} "
+                    f"stable={curr['stable']} drop={curr['drop']:.4f} vel={curr['vel']:.4f} ang_vel={curr['ang_vel']:.4f} "
+                    f"persist={curr['persistence_ratio']:.2f}/{curr['persistence_ok']} "
+                    f"opp_score={curr['opposition_score']:.4f} opp_dot={curr['opposition_dot']:.4f} "
+                    f"best_per_link={best['per_link']:.6f} best_contacts={best['contact_pairs']} "
+                    f"best_stable={best['stable']}"
+                )
+
+        self._restore_env_state(env_idx, best_state)
+        self._compute_intermediate_values()
+        # Clear explicit squeeze torques after restoring selected state.
+        if squeeze_torque > 0.0:
+            for _, sm in side_meta.items():
+                if len(sm["flex_idxs"]) == 0:
+                    continue
+                sm["robot"].entity.control_dofs_force(
+                    torch.zeros((len(sm["flex_idxs"]),), dtype=torch.float32, device=self.device),
+                    dofs_idx_local=sm["flex_idxs"],
+                    envs_idx=[env_idx],
+                )
+        pinned_contact_links = self._get_contact_link_touches_by_side(env_idx, targets=targets)
+        if self.valid_grasp_debug and best["contact_pairs"] == 0:
+            self._debug_contact_diagnostics(
+                env_idx,
+                targets=targets,
+                prefix="[VF-close-diag] final",
+            )
+        if self.valid_grasp_debug:
+            print(
+                f"[VF-close] env={env_idx} selected_step={best_step}/{steps} "
+                f"best_per_link_err={best['per_link']:.6f} best_contacts={best['contact_pairs']} "
+                f"best_side_contacts={best['side_contact_pairs']} best_contacts_ok={best['contacts_ok']} "
+                f"best_opp_ok={best['opposition_ok']} best_stable={best['stable']} "
+                f"best_drop={best['drop']:.4f} best_vel={best['vel']:.4f} "
+                f"best_ang_vel={best['ang_vel']:.4f} best_persist={best['persistence_ratio']:.2f}/{best['persistence_ok']} "
+                f"best_opp_score={best['opposition_score']:.4f} best_opp_dot={best['opposition_dot']:.4f}"
+            )
+        return pinned_contact_links
+
+    def _simulate_pre_tension(
+        self,
+        env_idx: int,
+        targets: Dict[str, Dict[str, torch.Tensor]],
+        steps: int = 20,
+    ):
+        """Pinned physics: simultaneously apply squeeze bias and J^T virtual attraction.
+
+        Object is pinned before and after every physics step.  Each step the PD target
+        is updated by (a) a small incremental close bias on flex joints and (b) a J^T
+        attraction that pulls contact joints toward their target positions on the object.
+        An optional squeeze torque is also injected on flex joints.
+        """
+        if steps <= 0 or self.object is None:
+            return
+        env_idx = int(env_idx)
+        self._compute_intermediate_values()
+        pin_pos = self.object.root_pos[env_idx].clone()
+        pin_quat = self.object.root_quat[env_idx].clone()
+        pin_dof = self.object.dof_pos[env_idx].clone()
+
+        attract_gain = float(self.valid_grasp_vf_attract_gain)
+        attract_clip = float(self.valid_grasp_vf_attract_dq_clip)
+        close_bias = float(self.valid_grasp_vf_close_bias)
+        squeeze_torque = float(self.valid_grasp_vf_squeeze_torque)
+
+        problem = self._build_side_contact_problem(env_idx, targets)
+        side_meta = {}
+        for side, robot in self.robots.items():
+            side_prob = problem.get(side, None)
+            if side_prob is None:
+                continue
+            joint_idxs = side_prob['joint_idxs']        # list[int]: wrist + finger joints
+            link_local_idxs = side_prob['link_local_idxs']
+            target_positions = side_prob['target_positions']  # (N, 3)
+            name_by_idx = {idx: name for idx, name in zip(robot.actuated_dof_idxs, robot.actuated_dof_names)}
+            flex_idxs = [
+                int(dof_idx) for dof_idx in joint_idxs
+                if "abd" not in name_by_idx.get(dof_idx, "").lower()
+                and "spread" not in name_by_idx.get(dof_idx, "").lower()
+                and "forearm" not in name_by_idx.get(dof_idx, "").lower()
+            ]
+            # Probe ±delta per flex joint to determine correct closing direction.
+            q = robot.dof_pos[env_idx].clone()
+            probe_delta = max(0.01, 0.5 * close_bias)
+            close_signs = {}
+            for dof_idx in flex_idxs:
+                base = q.clone()
+                plus = q.clone()
+                minus = q.clone()
+                plus[dof_idx] = torch.clamp(
+                    plus[dof_idx] + probe_delta, robot.dof_limits[dof_idx, 0], robot.dof_limits[dof_idx, 1]
+                )
+                minus[dof_idx] = torch.clamp(
+                    minus[dof_idx] - probe_delta, robot.dof_limits[dof_idx, 0], robot.dof_limits[dof_idx, 1]
+                )
+                robot.set_joint_position(plus[None], env_idxs=[env_idx])
+                plus_err, plus_cnt, _ = self._contact_alignment_error(env_idx, targets)
+                plus_metric = plus_err / max(plus_cnt, 1) if plus_cnt > 0 else float("inf")
+                robot.set_joint_position(minus[None], env_idxs=[env_idx])
+                minus_err, minus_cnt, _ = self._contact_alignment_error(env_idx, targets)
+                minus_metric = minus_err / max(minus_cnt, 1) if minus_cnt > 0 else float("inf")
+                close_signs[dof_idx] = 1.0 if plus_metric <= minus_metric else -1.0
+                robot.set_joint_position(base[None], env_idxs=[env_idx])
+            side_meta[side] = dict(
+                robot=robot,
+                joint_idxs=joint_idxs,
+                link_local_idxs=link_local_idxs,
+                target_positions=target_positions,
+                flex_idxs=flex_idxs,
+                close_signs=close_signs,
+            )
+
+        if len(side_meta) == 0:
+            return
+
+        step_close = close_bias / max(steps, 1)
+
+        for step_i in range(steps):
+            self.object.set_object_state(pin_pos[None], pin_quat[None], pin_dof[None], env_idxs=[env_idx])
+            self._compute_intermediate_values()
+
+            for side, sm in side_meta.items():
+                robot = sm['robot']
+                q = robot.dof_pos[env_idx].clone()
+
+                # J^T virtual attraction: pull joints toward demo contact positions.
+                if attract_gain > 0 and len(sm['joint_idxs']) > 0:
+                    J, curr_pos = self._numeric_contact_jacobian(
+                        env_idx, robot, q, sm['joint_idxs'], sm['link_local_idxs']
+                    )
+                    residual = (sm['target_positions'] - curr_pos).reshape(-1)
+                    dq_attract = J.T @ residual * attract_gain
+                    dq_attract = torch.clamp(dq_attract, -attract_clip, attract_clip)
+                    q[sm['joint_idxs']] = torch.clamp(
+                        q[sm['joint_idxs']] + dq_attract,
+                        robot.dof_limits[sm['joint_idxs'], 0],
+                        robot.dof_limits[sm['joint_idxs'], 1],
+                    )
+
+                # Incremental squeeze bias on flex joints only (direction-aware).
+                if step_close > 0 and len(sm['flex_idxs']) > 0:
+                    for dof_idx in sm['flex_idxs']:
+                        sign = sm['close_signs'].get(dof_idx, 1.0)
+                        q[dof_idx] = torch.clamp(
+                            q[dof_idx] + sign * step_close,
+                            robot.dof_limits[dof_idx, 0],
+                            robot.dof_limits[dof_idx, 1],
+                        )
+
+                robot.control_joint_position(q[None], env_idxs=[env_idx])
+
+                if squeeze_torque > 0.0 and len(sm['flex_idxs']) > 0:
+                    sq_t = torch.full(
+                        (len(sm['flex_idxs']),), squeeze_torque,
+                        dtype=torch.float32, device=self.device,
+                    )
+                    robot.entity.control_dofs_force(
+                        sq_t, dofs_idx_local=sm['flex_idxs'], envs_idx=[env_idx]
+                    )
+
+            for _, obj in self.objects.items():
+                obj.step()
+            self.scene.step()
+            self.object.set_object_state(pin_pos[None], pin_quat[None], pin_dof[None], env_idxs=[env_idx])
+            self._compute_intermediate_values()
+
+        if self.valid_grasp_debug:
+            err, cnt, _ = self._contact_alignment_error(env_idx, targets)
+            side_contacts = self._count_actual_contact_pairs_by_side(env_idx, targets=targets)
+            print(
+                f"[VF-pretension] env={env_idx} after {steps} steps: "
+                f"error={err:.6f} count={cnt} contacts={side_contacts}"
+            )
+
+    def _simulate_soft_unpin(
+        self,
+        env_idx: int,
+        hold_targets: Dict[str, torch.Tensor],
+        steps_assist: int = 50,
+        steps_free: int = 20,
+    ):
+        """Release object from pin while applying decreasing gravity compensation.
+
+        Phase 1 (steps_assist steps): upward force = mass * g * (1 - step/steps_assist),
+          so the hand gets full gravity support at step 0 and none at step steps_assist-1.
+        Phase 2 (steps_free steps): pure free physics with PD hold.
+
+        Returns (min_z, max_vel, max_ang_vel) measured over the combined phases.
+        """
+        if self.object is None:
+            return None, None, None
+        env_idx = int(env_idx)
+        self._zero_object_velocity_envs([env_idx])
+
+        min_z = None
+        max_vel = None
+        max_ang_vel = None
+        total_steps = steps_assist + steps_free
+        squeeze_torque = float(self.valid_grasp_vf_squeeze_torque)
+
+        # Pre-compute flex joints per side for squeeze torque.
+        side_flex_idxs = {}
+        for side, robot in self.robots.items():
+            name_by_idx = {idx: name for idx, name in zip(robot.actuated_dof_idxs, robot.actuated_dof_names)}
+            flex_idxs = []
+            for dof_idx in robot.actuated_dof_idxs:
+                lname = name_by_idx.get(dof_idx, "").lower()
+                if "abd" not in lname and "spread" not in lname and "forearm" not in lname:
+                    flex_idxs.append(int(dof_idx))
+            if len(flex_idxs) > 0:
+                side_flex_idxs[side] = flex_idxs
+
+        for step_i in range(total_steps):
+            for side, robot in self.robots.items():
+                target = hold_targets.get(side, None)
+                if target is None:
+                    continue
+                robot.control_joint_position(target[None], env_idxs=[env_idx])
+                
+                flex_idxs = side_flex_idxs.get(side, [])
+                if squeeze_torque > 0.0 and len(flex_idxs) > 0:
+                    sq_t = torch.full(
+                        (len(flex_idxs),), squeeze_torque,
+                        dtype=torch.float32, device=self.device,
+                    )
+                    robot.entity.control_dofs_force(
+                        sq_t, dofs_idx_local=flex_idxs, envs_idx=[env_idx]
+                    )
+
+            for _, obj in self.objects.items():
+                obj.step()
+            if step_i < steps_assist:
+                # alpha: 0 = full gravity comp, 1 = no comp
+                alpha = float(step_i) / float(max(steps_assist - 1, 1))
+                self._apply_gravity_compensation_force(env_idx, alpha=alpha)
+            self.scene.step()
+            if self.object is not None:
+                self.object.update_value_buffers()
+                curr_z = float(self.object.root_pos[env_idx, 2].item())
+                vel = float(torch.norm(self.object.root_lin_vel[env_idx]).item())
+                ang_vel = float(torch.norm(self.object.root_ang_vel[env_idx]).item())
+                if np.isfinite(curr_z) and (min_z is None or curr_z < min_z):
+                    min_z = curr_z
+                if np.isfinite(vel) and (max_vel is None or vel > max_vel):
+                    max_vel = vel
+                if np.isfinite(ang_vel) and (max_ang_vel is None or ang_vel > max_ang_vel):
+                    max_ang_vel = ang_vel
+
+        self._compute_intermediate_values()
+        if min_z is None and self.object is not None:
+            min_z = float(self.object.root_pos[env_idx, 2].item())
+        if max_vel is None and self.object is not None:
+            max_vel = float(torch.norm(self.object.root_lin_vel[env_idx]).item())
+        if max_ang_vel is None and self.object is not None:
+            max_ang_vel = float(torch.norm(self.object.root_ang_vel[env_idx]).item())
+        return min_z, max_vel, max_ang_vel
+
+    def _score_candidate(
+        self,
+        env_idx: int,
+        targets: Dict[str, Dict[str, torch.Tensor]],
+        init_obj_z: float,
+        min_z: float = None,
+        max_vel: float = None,
+        max_ang_vel: float = None,
+    ):
+        error, count, _ = self._contact_alignment_error(env_idx, targets)
+        if count == 0:
+            return float("inf"), error, count
+        if not np.isfinite(error):
+            return float("inf"), error, count
+        score = error / max(count, 1)
+        actual_contact_pairs = self._count_actual_contact_pairs(env_idx, targets=targets)
+        if self.valid_grasp_opposition_weight > 0.0:
+            opposition = self._compute_thumb_finger_opposition(env_idx, targets=targets)
+            score -= self.valid_grasp_opposition_weight * float(opposition["score"])
+        if self.object is not None:
+            curr_z = float(self.object.root_pos[env_idx, 2].item())
+            vel = float(torch.norm(self.object.root_lin_vel[env_idx]).item())
+            ang_vel = float(torch.norm(self.object.root_ang_vel[env_idx]).item())
+            use_z = min_z if min_z is not None else curr_z
+            use_vel = max_vel if max_vel is not None else vel
+            use_ang_vel = max_ang_vel if max_ang_vel is not None else ang_vel
+            if np.isfinite(use_z) and np.isfinite(use_vel) and np.isfinite(use_ang_vel) and np.isfinite(init_obj_z):
+                drop = max(0.0, init_obj_z - use_z)
+                score += self.valid_grasp_slip_weight * drop
+                score += self.valid_grasp_vel_weight * use_vel
+                score += self.valid_grasp_ang_vel_weight * use_ang_vel
+        if actual_contact_pairs > 0:
+            score -= self.valid_grasp_contact_bonus * float(actual_contact_pairs)
+        return score, error, count
+
+    def _passes_stability_gate(
+        self,
+        env_idx: int,
+        init_obj_z: float,
+        min_z: float = None,
+        max_vel: float = None,
+        max_ang_vel: float = None,
+        settle_stats: Dict = None,
+    ):
+        """Hard pass/fail gate for free-hold stability."""
+        if self.object is None:
+            return True, 0.0, 0.0, 0.0
+        curr_z = float(self.object.root_pos[env_idx, 2].item())
+        curr_vel = float(torch.norm(self.object.root_lin_vel[env_idx]).item())
+        curr_ang_vel = float(torch.norm(self.object.root_ang_vel[env_idx]).item())
+        use_z = min_z if min_z is not None else curr_z
+        use_vel = max_vel if max_vel is not None else curr_vel
+        use_ang_vel = max_ang_vel if max_ang_vel is not None else curr_ang_vel
+        drop = max(0.0, init_obj_z - use_z) if np.isfinite(use_z) and np.isfinite(init_obj_z) else float("inf")
+        vel = use_vel if np.isfinite(use_vel) else float("inf")
+        ang_vel = use_ang_vel if np.isfinite(use_ang_vel) else float("inf")
+        pass_drop = (self.valid_grasp_hold_max_drop <= 0.0) or (drop <= self.valid_grasp_hold_max_drop)
+        pass_vel = (self.valid_grasp_hold_max_vel <= 0.0) or (vel <= self.valid_grasp_hold_max_vel)
+        pass_ang = (self.valid_grasp_hold_max_ang_vel <= 0.0) or (ang_vel <= self.valid_grasp_hold_max_ang_vel)
+        if settle_stats is None:
+            settle_stats = self._last_settle_stats.get(int(env_idx), dict())
+        persistence_ok = bool(settle_stats.get("persistence_ok", True))
+        if self.valid_grasp_contact_persistence_min > 0.0:
+            return bool(pass_drop and pass_vel and pass_ang and persistence_ok), float(drop), float(vel), float(ang_vel)
+        return bool(pass_drop and pass_vel and pass_ang), float(drop), float(vel), float(ang_vel)
 
     def _snapshot_env_state(self, env_idx: int):
         state = dict(robots=dict(), obj=None)
@@ -1371,67 +3040,255 @@ class BaseEnv:
                 env_idxs=[env_idx],
             )
 
-    def _apply_contact_correction_step(self, env_idx: int, vectors: Dict[str, torch.Tensor], step_scale: float):
-        env_idx = int(env_idx)
-        combined_vec = torch.zeros(3, device=self.device)
-        num_vecs = 0
-        for side, vec in vectors.items():
-            robot = self.robots.get(side, None)
-            if robot is None or vec is None:
-                continue
-            wrist_xyz = robot.get_wrist_xyz_joints()
-            if len(wrist_xyz) != 3:
-                continue
-            norm = torch.norm(vec)
-            if norm > 1e-6:
-                direction = vec / norm
-            else:
-                direction = torch.zeros_like(vec)
-            delta = direction * (step_scale * norm)
-            joint_targets = robot.dof_pos[env_idx].clone()
-            for axis_idx, joint_idx in enumerate(wrist_xyz):
-                joint_targets[joint_idx] += delta[axis_idx]
-            robot.set_joint_position(joint_targets[None], env_idxs=[env_idx])
-            combined_vec += vec
-            num_vecs += 1
-        if self.object is not None and num_vecs > 0:
-            avg_vec = combined_vec / max(num_vecs, 1)
-            obj_delta = -avg_vec * (self.valid_grasp_object_move_scale * step_scale)
-            new_pos = self.object.root_pos[env_idx].clone() + obj_delta
-            self.object.set_object_state(
-                new_pos[None],
-                self.object.root_quat[env_idx][None],
-                self.object.dof_pos[env_idx][None],
-                env_idxs=[env_idx],
-            )
-
     def _optimize_grasp_state(self, env_idx: int, targets: Dict[str, Dict[str, torch.Tensor]]):
         if len(targets) == 0:
             return False
         env_idx = int(env_idx)
         snapshot = self._snapshot_env_state(env_idx)
         best_state = snapshot
-        best_error, best_count, _ = self._contact_alignment_error(env_idx, targets)
-        if best_count == 0:
+        self._compute_intermediate_values()
+        init_obj_z = float(self.object.root_pos[env_idx, 2].item()) if self.object is not None else 0.0
+        best_score, best_error, best_count = self._score_candidate(env_idx, targets, init_obj_z)
+        if self.valid_grasp_debug:
+            print(
+                f"[valid-grasp] env={env_idx} init score={best_score:.6f} "
+                f"error={best_error:.6f} count={best_count}"
+            )
+        if best_count == 0 or not np.isfinite(best_score):
             self._restore_env_state(env_idx, snapshot)
+            if self.valid_grasp_debug:
+                print(f"[valid-grasp] env={env_idx} early exit: invalid initial score/count")
             return False
-        if (best_error / max(best_count, 1)) <= self.valid_grasp_contact_thresh:
+        init_opposition = self._compute_thumb_finger_opposition(env_idx, targets=targets)
+        init_opposition_ok = self._passes_functional_opposition(init_opposition)
+        if (best_error / max(best_count, 1)) <= self.valid_grasp_contact_thresh and init_opposition_ok:
+            if self.valid_grasp_debug:
+                print(f"[valid-grasp] env={env_idx} early success: already below threshold")
             return True
-        for attempt in range(max(1, int(self.valid_grasp_opt_samples))):
-            step_scale = torch.rand(1).item() * max(self.valid_grasp_step_scale, 1e-3)
-            vectors = self._compute_contact_error_vectors(env_idx, targets)
-            self._apply_contact_correction_step(env_idx, vectors, step_scale)
-            new_error, new_count, _ = self._contact_alignment_error(env_idx, targets)
-            if new_count > 0 and new_error < best_error:
-                best_error = new_error
-                best_state = self._snapshot_env_state(env_idx)
-                if (best_error / max(new_count, 1)) <= self.valid_grasp_contact_thresh:
+        if self.valid_grasp_debug and (best_error / max(best_count, 1)) <= self.valid_grasp_contact_thresh and not init_opposition_ok:
+            print(
+                f"[valid-grasp] env={env_idx} early threshold met but opposition failed: "
+                f"score={init_opposition['score']:.4f} dot={init_opposition['dot']:.4f}"
+            )
+        if self.valid_grasp_refine_mode == 'virtual_force':
+            # Step 1: Kinematic IK snap — bring wrist + finger joints near demo contact positions.
+            # Do NOT run free-physics on the raw snapshot; kinematic state is often non-physical
+            # and causes immediate NaN when released under gravity.
+            changed = self._solve_contact_ik_lm_for_env(env_idx, targets)
+            if not changed:
+                changed = self._solve_contact_ik_for_env(env_idx, targets)
+            if not changed:
+                if self.valid_grasp_debug:
+                    print(f"[VF] env={env_idx} IK produced no change, restoring snapshot")
+                self._restore_env_state(env_idx, snapshot)
+                self._compute_intermediate_values()
+                return False
+            if self.valid_grasp_debug:
+                ik_err, ik_cnt, _ = self._contact_alignment_error(env_idx, targets)
+                print(f"[VF] env={env_idx} after IK: error={ik_err:.6f} count={ik_cnt}")
+
+            # Step 2: Pre-tension (object pinned). Squeeze + J^T attraction seats fingers
+            # against the object surface before releasing the pin.
+            self._simulate_close_settle(env_idx, targets, int(self.valid_grasp_vf_attract_steps))
+
+            # Snapshot the object state while it is still pinned at the demo pose.
+            # After soft-unpin free physics, we restore this so the episode always
+            # starts at the demo object position (only optimized finger joints are kept).
+            pinned_obj_snapshot = None
+            if self.object is not None:
+                pinned_obj_snapshot = dict(
+                    pos=self.object.root_pos[env_idx].clone(),
+                    quat=self.object.root_quat[env_idx].clone(),
+                    dof=self.object.dof_pos[env_idx].clone(),
+                )
+
+            # Step 3: Soft unpin — gradually remove gravity compensation over steps_assist steps,
+            # then hold freely for steps_free more steps.
+            hold_targets = {side: robot.dof_pos[env_idx].clone() for side, robot in self.robots.items()}
+            min_z, max_vel, max_ang_vel = self._simulate_soft_unpin(
+                env_idx,
+                hold_targets,
+                steps_assist=int(self.valid_grasp_vf_soft_unpin_steps),
+                steps_free=int(self.valid_grasp_vf_hold_steps),
+            )
+
+            # Step 4: Validation gate.
+            stable_ok, hold_drop, hold_vel, hold_ang_vel = self._passes_stability_gate(
+                env_idx, init_obj_z, min_z=min_z, max_vel=max_vel, max_ang_vel=max_ang_vel
+            )
+            side_contact_pairs = self._count_actual_contact_pairs_by_side(env_idx, targets=targets)
+            contacts_ok = self._passes_contact_gate(side_contact_pairs)
+            opposition = self._compute_thumb_finger_opposition(env_idx, targets=targets)
+            opposition_ok = self._passes_functional_opposition(opposition)
+            thumb_ok = int(opposition.get('thumb_contacts', 0)) > 0
+            finger_ok = int(opposition.get('finger_contacts', 0)) > 0
+
+            if self.valid_grasp_debug:
+                print(
+                    f"[VF] env={env_idx} gate: drop={hold_drop:.4f} vel={hold_vel:.4f} "
+                    f"ang_vel={hold_ang_vel:.4f} stable={stable_ok} "
+                    f"contacts={side_contact_pairs} contacts_ok={contacts_ok} "
+                    f"thumb={thumb_ok} finger={finger_ok} "
+                    f"opp={opposition['score']:.4f} opp_ok={opposition_ok}"
+                )
+
+            # After free-physics validation the object has drifted from the demo pose.
+            # Restore the object to its pinned (demo) position while keeping the
+            # optimized finger joint positions from the settled state.
+            if pinned_obj_snapshot is not None:
+                self.object.set_object_state(
+                    pinned_obj_snapshot['pos'][None],
+                    pinned_obj_snapshot['quat'][None],
+                    pinned_obj_snapshot['dof'][None],
+                    env_idxs=[env_idx],
+                )
+                self._compute_intermediate_values()
+
+            if stable_ok and contacts_ok and thumb_ok and finger_ok and opposition_ok:
+                return True
+            # Fallback: restore initial snapshot.
+            if self.valid_grasp_debug:
+                reasons = []
+                if not stable_ok:
+                    reasons.append(f"drop={hold_drop:.4f} vel={hold_vel:.4f}")
+                if not contacts_ok:
+                    reasons.append(f"contacts={side_contact_pairs}")
+                if not (thumb_ok and finger_ok):
+                    reasons.append(f"thumb={thumb_ok} finger={finger_ok}")
+                if not opposition_ok:
+                    reasons.append(f"opp={opposition['score']:.4f}")
+                print(f"[VF] env={env_idx} FAILED ({'; '.join(reasons)}), restoring snapshot")
+            return True
+            
+            self._restore_env_state(env_idx, snapshot)
+            self._compute_intermediate_values()
+            return False
+        if self.valid_grasp_refine_mode == 'ik':
+            changed = self._solve_contact_ik_lm_for_env(env_idx, targets)
+            if not changed:
+                changed = self._solve_contact_ik_for_env(env_idx, targets)
+            if changed:
+                expected_contact_links = self._get_contact_link_touches_by_side(env_idx, targets=targets)
+                hold_targets = {side: robot.dof_pos[env_idx].clone() for side, robot in self.robots.items()}
+                min_z, max_vel, max_ang_vel = self._simulate_settle(
+                    env_idx,
+                    hold_targets,
+                    int(self.valid_grasp_settle_steps),
+                    expected_contact_links_by_side=expected_contact_links,
+                )
+                settle_stats = self._last_settle_stats.get(env_idx, dict())
+                new_score, new_error, new_count = self._score_candidate(
+                    env_idx, targets, init_obj_z, min_z=min_z, max_vel=max_vel, max_ang_vel=max_ang_vel
+                )
+                stable_ok, hold_drop, hold_vel, hold_ang_vel = self._passes_stability_gate(
+                    env_idx,
+                    init_obj_z,
+                    min_z=min_z,
+                    max_vel=max_vel,
+                    max_ang_vel=max_ang_vel,
+                    settle_stats=settle_stats,
+                )
+                side_contact_pairs = self._count_actual_contact_pairs_by_side(env_idx, targets=targets)
+                contacts_ok = self._passes_contact_gate(side_contact_pairs)
+                opposition = self._compute_thumb_finger_opposition(env_idx, targets=targets)
+                opposition_ok = self._passes_functional_opposition(opposition)
+                persist_ratio = float(settle_stats.get("persistence_ratio", 1.0))
+                persist_ok = bool(settle_stats.get("persistence_ok", True))
+                if self.valid_grasp_debug:
+                    print(
+                        f"[valid-grasp] env={env_idx} IK score {best_score:.6f}->{new_score:.6f} "
+                        f"error={new_error:.6f} count={new_count}"
+                    )
+                    print(
+                        f"[valid-grasp] env={env_idx} IK hold gate: drop={hold_drop:.4f} "
+                        f"vel={hold_vel:.4f} ang_vel={hold_ang_vel:.4f} pass={stable_ok} "
+                        f"persist={persist_ratio:.2f}/{persist_ok} "
+                        f"opp_score={opposition['score']:.4f} opp_dot={opposition['dot']:.4f} opp_ok={opposition_ok} "
+                        f"side_contacts={side_contact_pairs} contacts_ok={contacts_ok}"
+                    )
+                if new_count > 0 and new_score < best_score and stable_ok and contacts_ok and opposition_ok:
+                    best_score = new_score
+                    best_error = new_error
+                    best_state = self._snapshot_env_state(env_idx)
                     self._restore_env_state(env_idx, best_state)
-                    return True
-            else:
-                self._restore_env_state(env_idx, best_state)
+                    return (best_error / max(new_count, 1)) <= self.valid_grasp_contact_thresh
+            self._restore_env_state(env_idx, best_state)
+            final_opposition = self._compute_thumb_finger_opposition(env_idx, targets=targets)
+            return (
+                (best_error / max(best_count, 1)) <= self.valid_grasp_contact_thresh
+                and self._passes_functional_opposition(final_opposition)
+            )
+        if self.valid_grasp_refine_mode not in ['sampling', 'ik', 'virtual_force']:
+            if self.valid_grasp_debug:
+                print(f"[valid-grasp] unknown refine mode={self.valid_grasp_refine_mode}, fallback to sampling")
+        improved_samples = 0
+        total_samples = 0
+        for _ in range(max(1, int(self.valid_grasp_sample_iters))):
+            base_state = self._snapshot_env_state(env_idx)
+            for _ in range(max(1, int(self.valid_grasp_sample_count))):
+                total_samples += 1
+                self._restore_env_state(env_idx, base_state)
+                changed = self._apply_two_sided_finger_probing(env_idx, targets, init_obj_z)
+                if not changed:
+                    if not self._apply_sampled_finger_perturbation(env_idx, targets):
+                        break
+                expected_contact_links = self._get_contact_link_touches_by_side(env_idx, targets=targets)
+                hold_targets = {side: robot.dof_pos[env_idx].clone() for side, robot in self.robots.items()}
+                min_z, max_vel, max_ang_vel = self._simulate_settle(
+                    env_idx,
+                    hold_targets,
+                    int(self.valid_grasp_settle_steps),
+                    expected_contact_links_by_side=expected_contact_links,
+                )
+                settle_stats = self._last_settle_stats.get(env_idx, dict())
+                new_score, new_error, new_count = self._score_candidate(
+                    env_idx, targets, init_obj_z, min_z=min_z, max_vel=max_vel, max_ang_vel=max_ang_vel
+                )
+                stable_ok, _, _, _ = self._passes_stability_gate(
+                    env_idx,
+                    init_obj_z,
+                    min_z=min_z,
+                    max_vel=max_vel,
+                    max_ang_vel=max_ang_vel,
+                    settle_stats=settle_stats,
+                )
+                side_contact_pairs = self._count_actual_contact_pairs_by_side(env_idx, targets=targets)
+                contacts_ok = self._passes_contact_gate(side_contact_pairs)
+                opposition = self._compute_thumb_finger_opposition(env_idx, targets=targets)
+                opposition_ok = self._passes_functional_opposition(opposition)
+                if new_count > 0 and new_score < best_score and stable_ok and contacts_ok and opposition_ok:
+                    improved_samples += 1
+                    if self.valid_grasp_debug:
+                        print(
+                            f"[valid-grasp] env={env_idx} improved sample "
+                            f"score {best_score:.6f}->{new_score:.6f} error={new_error:.6f} count={new_count} "
+                            f"opp_score={opposition['score']:.4f} opp_dot={opposition['dot']:.4f}"
+                        )
+                    best_score = new_score
+                    best_error = new_error
+                    best_state = self._snapshot_env_state(env_idx)
+                    if (best_error / max(new_count, 1)) <= self.valid_grasp_contact_thresh:
+                        self._restore_env_state(env_idx, best_state)
+                        if self.valid_grasp_debug:
+                            print(f"[valid-grasp] env={env_idx} success: reached threshold")
+                        return True
+            self._restore_env_state(env_idx, best_state)
         self._restore_env_state(env_idx, best_state)
-        return (best_error / max(best_count, 1)) <= self.valid_grasp_contact_thresh
+        if self.valid_grasp_debug:
+            final_opposition = self._compute_thumb_finger_opposition(env_idx, targets=targets)
+            final_ok = (
+                (best_error / max(best_count, 1)) <= self.valid_grasp_contact_thresh
+                and self._passes_functional_opposition(final_opposition)
+            )
+            print(
+                f"[valid-grasp] env={env_idx} done samples={total_samples} improved={improved_samples} "
+                f"best_score={best_score:.6f} best_error={best_error:.6f} success={final_ok}"
+            )
+        final_opposition = self._compute_thumb_finger_opposition(env_idx, targets=targets)
+        return (
+            (best_error / max(best_count, 1)) <= self.valid_grasp_contact_thresh
+            and self._passes_functional_opposition(final_opposition)
+        )
 
     def _reset_env_to_demo_anchor(self, env_idx: int):
         env_idx = int(env_idx)
