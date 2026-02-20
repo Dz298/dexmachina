@@ -9,6 +9,7 @@ def get_curriculum_cfg(kwargs=dict()):
         "kp_init": 1000.0,
         "kv_init": 10.0,
         "force_range_init": 50.0, 
+        "gravity_init": 1.0,
         "wait_epochs": 2000,
         "decay_rew": False,
         "schedule": "exp", # or exp or uniform 
@@ -28,8 +29,8 @@ def get_curriculum_cfg(kwargs=dict()):
         "uniform_mode": "fast", # or slow
         # "upper_ratio": 0.9, # upper = curr_upper * (upper_ratio)
         # "lower_ratio": 0.8, # if fast: lower=curr_lower * lower_ratio, if slow: lower=curr_upper * lower_ratio
-        "upper_ratios": dict(kp=0.5, kv=0.9, fr=0.95),
-        "lower_ratios": dict(kp=0.5, kv=0.8, fr=0.9),
+        "upper_ratios": dict(kp=0.5, kv=0.9, fr=0.95, gravity=0.95),
+        "lower_ratios": dict(kp=0.5, kv=0.8, fr=0.9, gravity=0.9),
         "seed": 42,
         "decay_solimp": False,
         "solip_multiplier": 0.98,
@@ -43,7 +44,7 @@ def get_curriculum_cfg(kwargs=dict()):
         "zero_epoch": 30000, # set all zeros once beyond this hardstop
         "dialback_ep_len": 50,
         "dialback_min_epochs": 500,
-        "dialback_ratios": dict(kp=0.98, kv=0.98, fr=0.98), # don't fully reset to prev gains, instead decay by this ratio 
+        "dialback_ratios": dict(kp=0.98, kv=0.98, fr=0.98, gravity=0.98), # don't fully reset to prev gains, instead decay by this ratio 
     }
     # update with kwargs
     curr_cfg.update(kwargs)
@@ -60,6 +61,7 @@ class Curriculum:
             "kp": curr_cfg['kp_init'],
             "kv": curr_cfg['kv_init'],
             "fr": curr_cfg['force_range_init'],
+            "gravity": curr_cfg.get('gravity_init', 1.0),
         }
         self.curr_gains = self.init_gains.copy()
         self.curr_gains_lower = self.init_gains.copy() # use for uniform mode
@@ -69,13 +71,15 @@ class Curriculum:
         # first figure out which terms to decay:
         decay_terms = []
         if self.gain_mode == "all":
-            decay_terms = ["kp", "kv", "fr"]
+            decay_terms = ["kp", "kv", "fr", "gravity"]
         elif "kp" in self.gain_mode:
             decay_terms.append("kp")
         elif "kv" in self.gain_mode:
             decay_terms.append("kv")
         elif "fr" in self.gain_mode:
             decay_terms.append("fr")
+        elif "gravity" in self.gain_mode:
+            decay_terms.append("gravity")
         else:
             raise ValueError("Invalid gain mode")
         self.decay_terms = decay_terms
@@ -158,20 +162,22 @@ class Curriculum:
             # two stage linear decay
             first_stop = self.curr_cfg['first_stop_iter']
             second_stop = self.curr_cfg['second_stop_iter']
+            mid_gains = {k: v * self.curr_cfg['first_ratio'] for k, v in self.init_gains.items()}
             if epoch_num < first_stop:
-                mid_gains = {k: v * self.curr_cfg['first_ratio'] for k, v in self.init_gains.items()}
                 frac = epoch_num / first_stop
                 new_gains = {
                     "kp": self.init_gains['kp'] * (1 - frac) + mid_gains['kp'] * frac,
                     "kv": self.init_gains['kv'] * (1 - frac) + mid_gains['kv'] * frac,
                     "fr": self.init_gains['fr'] * (1 - frac) + mid_gains['fr'] * frac,
+                    "gravity": self.init_gains['gravity'] * (1 - frac) + mid_gains['gravity'] * frac,
                 }
             elif epoch_num < second_stop:
                 frac = (epoch_num - first_stop) / (second_stop - first_stop)
                 new_gains = {
-                    "kp": mid_gains['kp'] * (1 - frac) + self.init_gains['kp'] * frac,
-                    "kv": mid_gains['kv'] * (1 - frac) + self.init_gains['kv'] * frac,
-                    "fr": mid_gains['fr'] * (1 - frac) + self.init_gains['fr'] * frac,
+                    "kp": mid_gains['kp'] * (1 - frac),
+                    "kv": mid_gains['kv'] * (1 - frac),
+                    "fr": mid_gains['fr'] * (1 - frac),
+                    "gravity": mid_gains['gravity'] * (1 - frac),
                 }
             else:
                 new_gains = {k: 0.0 for k in self.init_gains}
@@ -253,7 +259,7 @@ class Curriculum:
         for k, v in self.curr_gains.items():
             ratio = self.upper_ratios[k]
             new_gains[k] = v * ratio
-        if "kp" in new_gains and new_gains['kp'] < 0.05 or "fr" in new_gains and new_gains['fr'] < 0.01:
+        if ("kp" in new_gains and new_gains['kp'] < 0.05) or ("fr" in new_gains and new_gains['fr'] < 0.01) or ("gravity" in new_gains and new_gains['gravity'] < 0.01):
             new_gains = {k: 0.0 for k in new_gains}
         for k in self.decay_terms:
             self.curr_gains[k] = new_gains[k]
@@ -277,7 +283,7 @@ class Curriculum:
         else:
             raise ValueError("Invalid uniform mode") 
             
-        if ('kp' in self.decay_terms and self.curr_gains['kp'] < 0.05) or ('fr' in self.decay_terms and self.curr_gains['fr'] < 0.01):
+        if ('kp' in self.decay_terms and self.curr_gains['kp'] < 0.05) or ('fr' in self.decay_terms and self.curr_gains['fr'] < 0.01) or ('gravity' in self.decay_terms and self.curr_gains['gravity'] < 0.01):
             for k in self.decay_terms:
                 self.curr_gains[k] = 0.0
                 self.curr_gains_lower[k] = 0.0

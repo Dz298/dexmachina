@@ -166,11 +166,15 @@ def get_all_env_cfg(args, device, load_retarget_data=True):
         reward_cfg['task_rew_weight'] = 0.0 
         object_cfgs = dict()
 
-    assert len(args.upper_ratios) == len(args.lower_ratios) == 3, "Upper and lower ratios should have length 3"
+    assert len(args.upper_ratios) == len(args.lower_ratios) in [3, 4], "Upper and lower ratios should have length 3 or 4"
     ups = list(args.upper_ratios)
     lows = list(args.lower_ratios)
     upper_ratios = dict(kp=ups[0], kv=ups[1], fr=ups[2])
     lower_ratios = dict(kp=lows[0], kv=lows[1], fr=lows[2])
+    if len(ups) == 4:
+        upper_ratios['gravity'] = ups[3]
+        lower_ratios['gravity'] = lows[3]
+
     curr_rew_thres = list(args.curr_rew_thres)
     assert len(curr_rew_thres) == 4, "Curriculum reward thresholds should have length 4"
     zero_epoch = max(int(args.max_epochs - args.num_zero_epoch), 0)
@@ -195,6 +199,7 @@ def get_all_env_cfg(args, device, load_retarget_data=True):
             kp_init=args.kp_init,
             kv_init=args.kv_init,
             force_range_init=args.force_range_init, 
+            gravity_init=args.gravity_init,
             rew_thresholds=dict(
                 task=curr_rew_thres[0],
                 con=curr_rew_thres[1],
@@ -225,7 +230,12 @@ def get_all_env_cfg(args, device, load_retarget_data=True):
             zero_epoch=zero_epoch, # set this to last 
             dialback_ep_len=args.dialback_ep_len,
             dialback_min_epochs=args.dialback_min_epochs,
-            dialback_ratios=dict(kp=args.dialback_ratios[0], kv=args.dialback_ratios[1], fr=args.dialback_ratios[2]),
+            dialback_ratios=dict(
+                kp=args.dialback_ratios[0], 
+                kv=args.dialback_ratios[1], 
+                fr=args.dialback_ratios[2],
+                **({'gravity': args.dialback_ratios[3]} if len(args.dialback_ratios) == 4 else {})
+            ),
         )
         curr_cfg = get_curriculum_cfg(curr_kwargs)
     
@@ -337,6 +347,7 @@ def get_common_argparser():
     parser.add_argument('--kp_init', type=float, default=100.0)
     parser.add_argument('--kv_init', type=float, default=10.0)
     parser.add_argument('--force_range_init', type=float, default=50.0)
+    parser.add_argument('--gravity_init', type=float, default=1.0)
     parser.add_argument("--max_epochs", "-me", type=int, default=5000, help="Maximum number of epochs to train the agent.")     
     parser.add_argument('--num_zero_epoch', '-nze', type=int, default=1000)
     parser.add_argument('--curr_schedule', type=str, default='uniform', choices=['fixed', 'exp', 'uniform'])
@@ -351,8 +362,8 @@ def get_common_argparser():
     
     # uniform-sampling schedule 
     parser.add_argument('--uniform_mode', '-um', type=str, default='slow', choices=['fast', 'slow'])
-    parser.add_argument('--upper_ratios', type=float, nargs='+', default=[0.8, 0.95, 0.95])
-    parser.add_argument('--lower_ratios', type=float, nargs='+', default=[0.7, 0.9, 0.9])
+    parser.add_argument('--upper_ratios', type=float, nargs='+', default=[0.8, 0.95, 0.95, 0.95])
+    parser.add_argument('--lower_ratios', type=float, nargs='+', default=[0.7, 0.9, 0.9, 0.9])
     parser.add_argument('--deque_len', type=int, default=30)
     parser.add_argument('--decay_solimp', '-ds', action='store_true')
     parser.add_argument('--solip_multiplier', '-solip', type=float, default=0.95)
@@ -361,7 +372,7 @@ def get_common_argparser():
 
     parser.add_argument('--dialback_ep_len', type=int, default=30)
     parser.add_argument('--dialback_min_epochs', type=int, default=500)
-    parser.add_argument('--dialback_ratios', type=float, nargs='+', default=[0.98, 1.0, 1.0])
+    parser.add_argument('--dialback_ratios', type=float, nargs='+', default=[0.98, 1.0, 1.0, 0.98])
 
     # Latent world model arguments
     parser.add_argument('--use_latent_world_model', '-wm', action='store_true', 

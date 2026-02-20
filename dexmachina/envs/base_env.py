@@ -257,6 +257,10 @@ class BaseEnv:
             if not isinstance(solver, RigidSolver):
                 continue
             self.rigid_solver = solver 
+        
+        # Determine global gravity scale for computing compensation force
+        self.global_gravity = float(self.scene.sim.gravity[2])
+
 
         self.robot_cfgs = robot_cfgs
         self.robots = dict()
@@ -323,6 +327,10 @@ class BaseEnv:
                 sim=self.scene.sim,
                 rigid_solver=self.rigid_solver,
             )
+            
+        # Object mass buffer for gravity compensation
+        self.object_mass_buffer = None
+
         cardbox_size = (0.2,0.2,0.1)
         if self.n_objects == 1 and 'notebook' in self.object_names[0]:
             print("Adding a SMALLER cardboard box for notebook") 
@@ -430,6 +438,10 @@ class BaseEnv:
             assert self.n_objects == 1, "Only support one object for now"
             obj = self.objects[self.object_names[0]]
             self.obj_verts = {part: obj.sample_mesh_vertices(300, part) for part in ['top', 'bottom']}
+            
+        if self.n_objects > 0:
+            link_masses = [link.get_mass() for link in self.object.entity.links]
+            self.object_mass_buffer = torch.tensor(link_masses, device=self.device, dtype=torch.float32)
         
         self.observe_contact_force = env_cfg.get('observe_contact_force', False)
         if self.n_objects == 0:
@@ -702,6 +714,18 @@ class BaseEnv:
         for k, obj in self.objects.items():
             obj.step()
             
+        # Apply object gravity compensation if curriculum is active
+        if self.use_curriculum and self.curriculum is not None:
+            curr_gains = self.curriculum.get_current_gains()
+            if 'gravity' in curr_gains and curr_gains['gravity'] > 0.0 and self.n_objects == 1 and self.object_mass_buffer is not None:
+                gravity_gain = curr_gains['gravity']
+                # Create an upward force corresponding to the link masses and gravity gain
+                comp_force = torch.zeros((self.num_envs, self.object.n_links, 3), device=self.device, dtype=torch.float32)
+                # Note: global_gravity is negative (e.g., -9.81), so we subtract it
+                comp_force[..., 2] = -self.global_gravity * self.object_mass_buffer * gravity_gain
+                global_link_idxs = [link.idx for link in self.object.entity.links]
+                self.rigid_solver.apply_links_external_force(comp_force, global_link_idxs)
+
         self.randomization.on_step(self.episode_length_buf)
         self.scene.step()  
         self.episode_length_buf += 1
