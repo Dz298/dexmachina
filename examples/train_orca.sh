@@ -2,10 +2,11 @@
 # Training script for Orca Hand on box manipulation task
 
 HAND=orca_hand
+HAND=allegro_hand
 CLIP=ketchup-30-130
 
 # Full run with thumb weighting (5000 epochs) + latent world model
-EXP_NAME=hybrid_start_stable_gravity_comp
+EXP_NAME=residual_start_stable_gravity_comp_rand_init_0.3
 python dexmachina/rl/train_rl_games.py -B 6000 -obf -obt --max_epochs 5000 \
     --actuate_object --retarget_name para --horizon 16 -imw 0.5 --gain_mode all \
     --curr_schedule uniform --wait_epochs 100 --learning_rate 0.0003 \
@@ -17,7 +18,8 @@ python dexmachina/rl/train_rl_games.py -B 6000 -obf -obt --max_epochs 5000 \
     -ert 0.4 --contact_beta 10 \
     --hybrid_scales 0.1 1.0 --kp_init 80 --kv_init 5 \
     --thumb_weight 4.0 \
-    --clip $CLIP -imi 0.3 -bc 0.3 -con 10 -exp $EXP_NAME --hand $HAND 
+    --clip $CLIP -imi 0.3 -bc 0.3 -con 10 -exp $EXP_NAME --hand $HAND \
+    --rand_init_ratio 0.3 -am residual --res_cap 
     # --use_latent_world_model --wm_latent_dim 64 
     
 

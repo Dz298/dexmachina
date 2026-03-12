@@ -13,6 +13,7 @@ from dexmachina.envs.maniptrans_curr import ManipTransCurriculum
 from typing import Dict, List, Tuple, Union
 from collections import deque
 from genesis.engine.solvers.rigid.rigid_solver_decomp import RigidSolver
+from dexmachina.utils.grasp_optimizer import GraspQPOptimizer
 
 TABLE_HEIGHT = 0.6
 OBJ_DEFAULT_POS = (0.0597, -0.2476,  1.0354)
@@ -267,6 +268,24 @@ class BaseEnv:
             self.valid_grasp_refine_mode = 'ik' if self.valid_grasp_use_ik else 'sampling'
         self._warned_no_active_contact_finger = False
         self._last_settle_stats = dict()
+
+        self.grasp_optimizer = None   # kept for backward compat checks
+        self.grasp_optimizers = {}     # per-side optimizers
+        if self.enforce_valid_rand_init_grasp:
+            from graspqp.hands import AVAILABLE_HANDS
+            for side in ['left', 'right']:
+                if side not in robot_cfgs:
+                    continue
+                raw_hand_name = robot_cfgs[side].get('name', 'allegro')
+                hand_name_with_side = f"{raw_hand_name}_{side}"
+                if hand_name_with_side in AVAILABLE_HANDS:
+                    hand_name = hand_name_with_side
+                else:
+                    hand_name = raw_hand_name
+                self.grasp_optimizers[side] = GraspQPOptimizer(env=self, hand_name=hand_name, device=device)
+            # Provide a backwards-compat single reference (first available side)
+            if self.grasp_optimizers:
+                self.grasp_optimizer = next(iter(self.grasp_optimizers.values()))
 
         # Latent world model config
         self.use_latent_world_model = env_cfg.get('use_latent_world_model', False)
@@ -1318,13 +1337,14 @@ class BaseEnv:
                 continue
             if avg_err > self.valid_grasp_contact_thresh:
                 invalid_envs.append(env_idx)
-        if len(invalid_envs) == 0:
+        if not invalid_envs:
             self._zero_object_velocity_envs(candidate_envs)
-            if self.valid_grasp_debug:
-                print(f"[valid-grasp] no invalid envs among candidates={candidate_envs}")
             return
         if self.valid_grasp_debug:
             print(f"[valid-grasp] invalid envs={invalid_envs} from candidates={candidate_envs}")
+        
+        
+        
         for env_idx in invalid_envs:
             targets = targets_map.get(env_idx, dict())
             success = self._optimize_grasp_state(env_idx, targets)
@@ -1332,6 +1352,44 @@ class BaseEnv:
                 if self.valid_grasp_debug:
                     print(f"[valid-grasp] env={env_idx} optimize failed, fallback_to_zero=True")
                 self._reset_env_to_demo_anchor(env_idx)
+        # if self.grasp_optimizers:
+        #     import random as _random
+        #     # Identify which sides have contact for each invalid env.
+        #     # If both sides are in contact in a given env, pick one at random.
+        #     # The idle side is reset to its demo pose.
+        #     for env_idx in invalid_envs:
+        #         active_sides = list(self._get_active_contact_fingers(targets_map[env_idx]).keys())
+        #         if not active_sides:
+        #             # No contact detected – skip this env
+        #             continue
+        #         if len(active_sides) == 1:
+        #             optimize_side = active_sides[0]
+        #         else:
+        #             # Both hands in contact – GraspQP cannot do multi-hand; pick one at random
+        #             optimize_side = _random.choice(active_sides)
+        #             idle_side = [s for s in active_sides if s != optimize_side][0]
+        #             idle_robot = self.robots.get(idle_side)
+        #             if idle_robot is not None:
+        #                 # Reset idle hand to demo pose
+        #                 idle_tensor = torch.tensor([env_idx], dtype=torch.long, device=self.device)
+        #                 idle_robot.reset_idx(idle_tensor, self.episode_start_buf[idle_tensor])
+
+        #         optimizer = self.grasp_optimizers.get(optimize_side)
+        #         robot = self.robots.get(optimize_side)
+        #         if optimizer is not None and robot is not None:
+        #             iters = self.env_cfg.get('valid_grasp_ik_iters', 50)
+        #             with torch.enable_grad():
+        #                 new_pos, new_quat, new_qpos = optimizer.optimize_grasps(
+        #                     robot, [env_idx], iters=iters
+        #                 )
+        #             env_tensor = torch.tensor([env_idx], dtype=torch.long, device=self.device)
+        #             robot.entity.set_pos(new_pos, envs_idx=env_tensor)
+        #             robot.entity.set_quat(new_quat, envs_idx=env_tensor)
+        #             robot.entity.set_dofs_position(
+        #                 new_qpos,
+        #                 dofs_idx_local=robot.actuated_dof_idxs,
+        #                 envs_idx=env_tensor,
+        #             )
         self._zero_object_velocity_envs(candidate_envs)
 
     def _get_demo_contact_targets_for_env(self, env_idx: int):

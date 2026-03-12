@@ -8,7 +8,8 @@ from dexmachina.envs.rewards import get_reward_cfg
 from dexmachina.envs.object import get_arctic_object_cfg
 import genesis as gs
 
-HAND_NAME = "orca_hand"
+# HAND_NAME = "orca_hand"
+HAND_NAME = "allegro_hand"
 OBJECT_NAME = "ketchup"
 FRAME_START = 160
 FRAME_END = 260
@@ -17,7 +18,7 @@ RENDER_RES = 512
 REFINE_MODE = "virtual_force"  # one of: sampling, ik, virtual_force
 RUN_ANNEAL_VIS = False
 ANNEAL_VIS_STEPS = 50
-RUN_OPT_QUALITY = True
+RUN_OPT_QUALITY = False
 NUM_TEST_FRAMES = 5
 TIGHT_SQUEEZE_DEBUG = True
 DEBUG_OBJECT_STATE_MATCH = True
