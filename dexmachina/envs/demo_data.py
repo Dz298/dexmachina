@@ -6,39 +6,81 @@ from os.path import join
 from dexmachina.asset_utils import get_asset_path
 
 ARCTIC_PROCESSED_DIR = get_asset_path("arctic/processed")
+DEXYCB_PROCESSED_DIR = get_asset_path("dexycb/processed")
 RETARGET_DIR = get_asset_path("retargeted")
-RETARGET_CONTACT_DIR= get_asset_path("contact_retarget")
+RETARGET_CONTACT_DIR = get_asset_path("contact_retarget")
+
+
+def _infer_hand_sides_from_world_coord(world_coord):
+    """Infer which hands have valid data from world_coord keys and content."""
+    sides = []
+    for side in ("left", "right"):
+        key = f"joints.{side}"
+        if key not in world_coord:
+            continue
+        arr = world_coord[key]
+        if arr.size > 0 and np.any(np.abs(arr) > 1e-8):
+            sides.append(side)
+    return sides if sides else ["left", "right"]
+
 
 def get_demo_data(
-    obj_name="box", 
-    frame_start=10, 
-    frame_end=30, 
-    hand_name='inspire_hand', 
-    subject_name="s01", 
+    obj_name="box",
+    frame_start=10,
+    frame_end=30,
+    hand_name="inspire_hand",
+    subject_name="s01",
     use_clip="01",
-    load_retarget_contact=False, 
+    load_retarget_contact=False,
+    hand_sides=None,
+    data_source="arctic",
+    data_fname=None,
+    sequence_id=None,
 ):
-    """ This is only processed Arctic data, not the raw data. Not including dexterous hand retargeting data. """
-    demo_fname = f"{ARCTIC_PROCESSED_DIR}/{subject_name}/{obj_name}_use_{use_clip}.npy"
-    demo_data = np.load(demo_fname, allow_pickle=True).item() 
-    world_coord = demo_data["world_coord"] 
-    # this contains dict_keys(['joints.left', 'joints.right', 'contacts.left', 'valid_contacts.left', 'contacts.right', 'valid_contacts.right', 'contact_threshold', 'contact_links_left', 'contact_links_right'])
-    demo_data = demo_data["params"] 
-    
+    """Load processed demo data (ARCTIC or DexYCB). Returns only data for present hand_sides."""
+    if data_fname is not None:
+        demo_fname = data_fname
+    elif data_source == "dexycb":
+        if sequence_id is None:
+            sequence_id = obj_name
+        demo_fname = f"{DEXYCB_PROCESSED_DIR}/{subject_name}/{sequence_id}.npy"
+        demo_fname = str(demo_fname)
+    else:
+        demo_fname = f"{ARCTIC_PROCESSED_DIR}/{subject_name}/{obj_name}_use_{use_clip}.npy"
+        demo_fname = str(demo_fname)
+
+    raw = np.load(demo_fname, allow_pickle=True).item()
+    world_coord = raw["world_coord"]
+    params = raw["params"]
+
+    if hand_sides is None:
+        hand_sides = _infer_hand_sides_from_world_coord(world_coord)
+
     demo_data = {
-        "obj_pos": demo_data["obj_trans"][frame_start:frame_end], 
-        "obj_quat": demo_data["obj_quat"][frame_start:frame_end],
-        "obj_arti": demo_data["obj_arti"][frame_start:frame_end], 
-        "contact_links_left": world_coord["contact_links_left"][frame_start:frame_end],
-        "contact_links_right": world_coord["contact_links_right"][frame_start:frame_end],
+        "obj_pos": params["obj_trans"][frame_start:frame_end],
+        "obj_quat": params["obj_quat"][frame_start:frame_end],
+        "obj_arti": params["obj_arti"][frame_start:frame_end],
     }
+    if data_source == "dexycb" and "ycb_class_name" in params:
+        demo_data["ycb_class_name"] = str(params["ycb_class_name"])
+    for side in hand_sides:
+        demo_data[f"contact_links_{side}"] = world_coord[f"contact_links_{side}"][
+            frame_start:frame_end
+        ]
+
     if load_retarget_contact:
         retar_contact = load_contact_retarget_data(
-            obj_name=obj_name, hand_name=hand_name, frame_start=frame_start, frame_end=frame_end,
-            use_clip=use_clip, subject_name=subject_name,
+            obj_name=obj_name,
+            hand_name=hand_name,
+            frame_start=frame_start,
+            frame_end=frame_end,
+            save_name="genesis",
+            use_clip=use_clip,
+            subject_name=subject_name,
+            hand_sides=hand_sides,
         )
-        print(f"Replacing demo_data with retarget contact data")
-        demo_data.update(retar_contact) 
+        print("Replacing demo_data with retarget contact data")
+        demo_data.update(retar_contact)
     return demo_data
  
 def get_joint_init_limits(joint_pos_dict):
@@ -58,26 +100,27 @@ def get_joint_init_limits(joint_pos_dict):
  
 def load_genesis_retarget_data(
     obj_name="box",
-    hand_name='inspire_hand',
+    hand_name="inspire_hand",
     frame_start=0,
     frame_end=100,
     save_name="genesis",
     use_clip="01",
     subject_name="s01",
     given_data_fname=None,
+    hand_sides=None,
 ):
-    """ data saved from new retargeting code """
+    """Data saved from retargeting code. hand_sides defaults to keys in retarget_data."""
     ret_type = "vector"
-    if 'shadow' in hand_name:
+    if "shadow" in hand_name:
         print(f"Using position retargeting for {hand_name}")
         ret_type = "position"
     if given_data_fname is not None:
         data_fname = given_data_fname
     else:
         data_fname = f"{RETARGET_DIR}/{hand_name}/{subject_name}/{obj_name}_use_{use_clip}_{ret_type}_{save_name}.npy"
+    data_fname = str(data_fname)
     loaded_tensor = False
     if not os.path.exists(data_fname):
-        # try .pt extension
         data_fname = data_fname.replace(".npy", ".pt")
         assert os.path.exists(data_fname), f"File {data_fname} not found"
 
@@ -85,27 +128,27 @@ def load_genesis_retarget_data(
         data = np.load(data_fname, allow_pickle=True).item()
     else:
         data = torch.load(data_fname)
-        loaded_tensor = True 
+        loaded_tensor = True
 
     demo_data = data["demo_data"]
     expected_length = frame_end - frame_start
-    
-    # Check if data is already pre-sliced (common for .pt files from parallel_retarget.py)
+
     first_val = next(iter(demo_data.values()))
-    data_length = first_val.shape[0] if hasattr(first_val, 'shape') else len(first_val)
-    already_sliced = (data_length == expected_length)
-    
+    data_length = first_val.shape[0] if hasattr(first_val, "shape") else len(first_val)
+    already_sliced = data_length == expected_length
+
     if already_sliced:
-        # Data is already sliced to correct range, don't slice again
         demo_data = {k: v for k, v in demo_data.items()}
     else:
         demo_data = {k: v[frame_start:frame_end] for k, v in demo_data.items()}
-    if len(demo_data['obj_arti'].shape) > 1:
-        demo_data['obj_arti'] = demo_data['obj_arti'][:, 0] # shape (num_frames,)
+    if len(demo_data["obj_arti"].shape) > 1:
+        demo_data["obj_arti"] = demo_data["obj_arti"][:, 0]
 
-    retarget_loaded = data["retarget_data"] 
+    retarget_loaded = data["retarget_data"]
+    if hand_sides is None:
+        hand_sides = list(retarget_loaded.keys())
     retarget_data = dict()
-    for side in ['left', 'right']:
+    for side in hand_sides:
         loaded = retarget_loaded[side]
         residual_qpos = loaded["joint_qpos"]
         if already_sliced:
@@ -156,26 +199,30 @@ def load_genesis_retarget_data(
 
 def load_contact_retarget_data(
     obj_name="box",
-    hand_name='inspire_hand',
+    hand_name="inspire_hand",
     frame_start=0,
     frame_end=100,
     save_name="genesis",
     use_clip="01",
     subject_name="s01",
+    hand_sides=None,
 ):
     # e.g. assets/contact_retarget/ability_hand/s01/box_use_01.npy
     fname = f"{RETARGET_CONTACT_DIR}/{hand_name}/{subject_name}/{obj_name}_use_{use_clip}.npy"
+    fname = str(fname)
     assert os.path.exists(fname), f"File {fname} not found"
     loaded = np.load(fname, allow_pickle=True).item()
-    
-    # Check if data is already pre-sliced
+
+    if hand_sides is None:
+        hand_sides = list(loaded.keys())
+
     expected_length = frame_end - frame_start
-    first_side_data = loaded['left']['dexlink_contacts']
+    first_side_data = loaded[hand_sides[0]]["dexlink_contacts"]
     data_length = first_side_data.shape[0]
-    already_sliced = (data_length == expected_length)
-    
+    already_sliced = data_length == expected_length
+
     retar_contact = dict()
-    for side in ['left', 'right']:
+    for side in hand_sides:
         data = loaded[side] 
         key_map = [
             ("dexlink_contacts", f"contact_links_{side}"),

@@ -837,10 +837,11 @@ class BaseRobot:
         self.entity.zero_all_dofs_velocity(envs_idx=env_idxs)
         
         prev_kpt_pos = self.kpt_pos[env_idxs, :].clone()
-        new_kpt_pos = self.entity.get_links_pos()[:, self.kpt_link_idxs, :] 
+        link_pos = self.entity.get_links_pos()
+        new_kpt_pos = link_pos[:, self.kpt_link_idxs, :]
         self.kpt_pos[env_idxs] = new_kpt_pos[env_idxs]
-        # reset wrist pose
-        self.wrist_pose[env_idxs, :3] = new_kpt_pos[env_idxs, self.wrist_link_idx, :]
+        # reset wrist pose (wrist_link_idx is index in full link list, not in kpt_link_idxs)
+        self.wrist_pose[env_idxs, :3] = link_pos[env_idxs, self.wrist_link_idx, :]
         self.wrist_pose[env_idxs, 3:] = self.entity.get_links_quat()[env_idxs, self.wrist_link_idx, :]
    
         # self.contact_forces[env_idxs, :] = 0.0

@@ -13,8 +13,9 @@ from pathlib import Path
 
 from dexmachina.asset_utils import get_asset_path
 from dexmachina.envs.robot import BaseRobot, get_default_robot_cfg
-from dexmachina.envs.object import ArticulatedObject, get_arctic_object_cfg
+from dexmachina.envs.object import ArticulatedObject, get_arctic_object_cfg, get_ycb_object_cfg
 from dexmachina.envs.demo_data import get_demo_data
+from dexmachina.retargeting.coordinate_utils import apply_dexycb_display_to_loaded_pt
 
 
 RETARGET_DIR = get_asset_path("retargeted")
@@ -114,16 +115,19 @@ def main(args):
     
     print(f"Loading retargeted data from: {fname}")
     loaded_data = torch.load(fname, weights_only=False)
+    apply_dexycb_display_to_loaded_pt(loaded_data)
     retarget_data = loaded_data['retargeter_results']
     demo_data = loaded_data['demo_data']
-    
+    sides = list(retarget_data.keys())
+    first_side = sides[0]
+
     # Get number of steps
-    num_steps = len(retarget_data['left']['hand_qpos'])
-    print(f"Loaded {num_steps} steps of retargeted hand motion")
-    
+    num_steps = len(retarget_data[first_side]['hand_qpos'])
+    print(f"Loaded {num_steps} steps of retargeted hand motion (sides: {sides})")
+
     # Print wrist position info for debugging
     print(f"\nHand positions (first frame):")
-    for side in ['left', 'right']:
+    for side in sides:
         wrist_pos = retarget_data[side]['wrist_qpos'][0][:3]
         print(f"  {side} wrist: x={wrist_pos[0]:.3f}, y={wrist_pos[1]:.3f}, z={wrist_pos[2]:.3f}")
     
@@ -137,19 +141,27 @@ def main(args):
         step_indices = range(0, num_steps, args.frame_skip)
         print(f"Rendering {len(list(step_indices))} frames (every {args.frame_skip} frame)")
     
-    # Setup robot configs
+    # Setup robot configs (only for sides present in retarget data)
     num_envs = 1  # Only need 1 env for video rendering
     robot_cfgs = dict()
-    sides = ['left', 'right'] if args.both_hands else [args.hand_side]
-    
-    for side in sides:
+    render_sides = sides if args.both_hands else [args.hand_side]
+    render_sides = [s for s in render_sides if s in sides]
+    if not render_sides:
+        render_sides = sides
+
+    for side in render_sides:
         cfg = get_default_robot_cfg(name=hand_name, side=side)
         cfg['action_mode'] = 'absolute'
         cfg['collect_data'] = False
         robot_cfgs[side] = cfg
-    
-    # Setup object config
-    obj_cfg = get_arctic_object_cfg(name=args.obj, convexify=False)
+
+    # Setup object config (Arctic or DexYCB)
+    params = loaded_data.get("params", {})
+    ycb_class = params.get("ycb_class_name") or (args.obj if args.obj and "_" in args.obj and args.obj[0].isdigit() else None)
+    if ycb_class:
+        obj_cfg = get_ycb_object_cfg(str(ycb_class))
+    else:
+        obj_cfg = get_arctic_object_cfg(name=args.obj, convexify=False)
     obj_cfg['fixed'] = True  # Keep object fixed in place
     obj_cfg['collect_data'] = False
     
@@ -178,7 +190,7 @@ def main(args):
     from tqdm import tqdm
     
     # Set initial hand positions first
-    for side in sides:
+    for side in render_sides:
         hand = hands[side]
         hand_qpos = retarget_data[side]['hand_qpos'][0]
         hand_qpos_tensor = torch.tensor(hand_qpos, device=device).unsqueeze(0)
@@ -197,7 +209,7 @@ def main(args):
     
     for frame_idx, step_idx in enumerate(tqdm(step_indices, desc="Rendering")):
         # Update hand states
-        for side in sides:
+        for side in render_sides:
             hand = hands[side]
             hand_qpos = retarget_data[side]['hand_qpos'][step_idx]
             hand_qpos_tensor = torch.tensor(hand_qpos, device=device).unsqueeze(0)

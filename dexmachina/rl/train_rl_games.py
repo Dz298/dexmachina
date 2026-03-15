@@ -16,7 +16,7 @@ from rl_games.torch_runner import Runner
 
 from dexmachina.asset_utils import get_rl_config_path
 from dexmachina.envs.base_env import BaseEnv 
-from dexmachina.envs.constructors import get_common_argparser, get_all_env_cfg, parse_clip_string
+from dexmachina.envs.constructors import get_common_argparser, get_all_env_cfg, parse_clip_string, parse_dexycb_clip
 from dexmachina.rl.rl_games_wrapper import RlGamesVecEnvWrapper, RlGamesGpuEnv
 from dexmachina.rl.latent_world_model import LatentWorldModel, WorldModelTrainer
 
@@ -93,10 +93,15 @@ def main():
     args = parser.parse_args()
 
     
-    obj_name, start, end, subject_name, use_clip = parse_clip_string(args.clip)
+    data_source = getattr(args, "data_source", "arctic")
+    if data_source == "dexycb":
+        subject_name, sequence_id, start, end = parse_dexycb_clip(args.clip)
+        obj_name, use_clip = sequence_id, "01"
+    else:
+        obj_name, start, end, subject_name, use_clip = parse_clip_string(args.clip)
     args.arctic_object = obj_name
     args.frame_start = start
-    args.frame_end = end 
+    args.frame_end = end
     
     hand_prefix = str(args.hand).split("_")[0]
     exp_name = hand_prefix + "-" + args.exp_name

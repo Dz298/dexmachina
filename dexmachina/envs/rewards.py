@@ -144,11 +144,18 @@ class RewardModule:
     def load_demo(self, demo_data, retarget_data, device):
         self.demo_tensors = dict()
         demo_keys = ["obj_pos", "obj_quat", "obj_arti"]
+        self.active_sides = [
+            s for s in ("left", "right")
+            if f"contact_links_{s}" in demo_data or (s in retarget_data and "kpts_data" in retarget_data.get(s, {}))
+        ]
+        if not self.active_sides:
+            self.active_sides = ["left", "right"]
         if self.contact_rew_weight > 0.0:
-            demo_keys += ["contact_links_left", "contact_links_right"]
-        
+            for side in self.active_sides:
+                demo_keys.append(f"contact_links_{side}")
+
         for key in demo_keys:
-            assert key in demo_data, f"{key} not in demo_data" 
+            assert key in demo_data, f"{key} not in demo_data"
             self.demo_tensors[key] = torch.tensor(
                 demo_data[key], dtype=torch.float32, device=device
             )
@@ -169,29 +176,26 @@ class RewardModule:
             )
 
         if self.use_imi_rew:
-            for side in ['left', 'right']:
+            for side in self.active_sides:
                 key = f"kpts_{side}"
                 self.demo_tensors[key] = torch.tensor(
-                    retarget_data[side]['kpts_data']['kpt_pos'], 
+                    retarget_data[side]["kpts_data"]["kpt_pos"],
                     dtype=torch.float32, device=device
                 )
         if self.contact_rew_weight > 0.0 or (self.use_imi_rew and self.imi_wrist_weight > 0.0):
-            # load wrist pose for contact reward
-            for side in ['left', 'right']:
+            for side in self.active_sides:
                 key = f"wrist_pose_{side}"
-                if isinstance(retarget_data[side]['wrist_pose'], torch.Tensor):
-                    self.demo_tensors[key] = retarget_data[side]['wrist_pose'].clone().to(device)
+                if isinstance(retarget_data[side]["wrist_pose"], torch.Tensor):
+                    self.demo_tensors[key] = retarget_data[side]["wrist_pose"].clone().to(device)
                 else:
                     self.demo_tensors[key] = torch.tensor(
-                        retarget_data[side]['wrist_pose'], dtype=torch.float32, device=device
+                        retarget_data[side]["wrist_pose"], dtype=torch.float32, device=device
                     )
-        
-        # Load collision link names and create thumb weight tensors
-        # Note: collision_link_names is stored in demo_data[side], not retarget_data
+
         self.contact_link_weights = {}
         if self.contact_rew_weight > 0.0 and self.thumb_weight != 1.0:
-            for side in ['left', 'right']:
-                if side in demo_data and 'collision_link_names' in demo_data[side]:
+            for side in self.active_sides:
+                if side in demo_data and "collision_link_names" in demo_data[side]:
                     link_names = demo_data[side]['collision_link_names']
                     # Create weight tensor: thumb links get thumb_weight, others get 1.0
                     weights = []
@@ -319,58 +323,60 @@ class RewardModule:
         kpts_left: torch.Tensor,
         kpts_right: torch.Tensor,
         episode_length_buf: torch.Tensor,
-    ): 
-        fingertip_dist_left = self.compute_keypoint_dist(kpts_left, episode_length_buf, left_hand=True)
-        fingertip_dist_right = self.compute_keypoint_dist(kpts_right, episode_length_buf, left_hand=False)
-        fingertip_dist = torch.mean( (fingertip_dist_left + fingertip_dist_right) / 2.0 , dim=-1) # (B, num_links) -> (B,)
+    ):
+        kpt_dists_per_side = {}
+        for side, kpts in [("left", kpts_left), ("right", kpts_right)]:
+            if kpts is None or side not in self.active_sides:
+                continue
+            kpt_dists_per_side[side] = self.compute_keypoint_dist(
+                kpts, episode_length_buf, left_hand=(side == "left")
+            )
+        if not kpt_dists_per_side:
+            return torch.zeros(episode_length_buf.shape[0], device=episode_length_buf.device), {}
+        stacked = torch.stack(list(kpt_dists_per_side.values()))
+        fingertip_dist = torch.mean(stacked.mean(dim=0), dim=-1)
         beta = self.cfg["imi_fingertip_beta"]
         if self.exp_kpt_first:
-            fingertip_rew_left = torch.exp(- beta * fingertip_dist_left)
-            fingertip_rew_right = torch.exp(- beta * fingertip_dist_right)
-            fingertip_rew = torch.mean( (fingertip_rew_left + fingertip_rew_right) / 2.0 , dim=-1) # (B, num_links) -> (B,) 
-        else:  
-            fingertip_rew = torch.exp(-self.cfg["imi_fingertip_beta"] * fingertip_dist) 
-        # 
-        if self.imi_wrist_weight > 0.0:
-            # do a rotation + position distance for wrist pose
-            wrist_rew_left, pos_dist_left, rot_dist_left = self.compute_wrist_reward(wrist_pose_left, episode_length_buf, side='left')
-            wrist_rew_right, pos_dist_right, rot_dist_right = self.compute_wrist_reward(wrist_pose_right, episode_length_buf, side='right')
-            wrist_rew = (wrist_rew_left + wrist_rew_right) / 2.0
-            imi_rew = self.imi_wrist_weight * wrist_rew + (1.0 - self.imi_wrist_weight) * fingertip_rew
+            fingertip_rew = torch.mean(
+                torch.stack([torch.exp(-beta * d) for d in kpt_dists_per_side.values()]).mean(dim=0),
+                dim=-1,
+            )
+        else:
+            fingertip_rew = torch.exp(-beta * fingertip_dist)
 
-            wrist_dist = torch.mean( (pos_dist_left + pos_dist_right) / 2.0 , dim=-1) # (B, num_links) -> (B,)
-            keypoint_dist = self.imi_wrist_weight * wrist_dist + (1.0 - self.imi_wrist_weight) * fingertip_dist
+        if self.imi_wrist_weight > 0.0:
+            wrist_rews, pos_dists = [], []
+            for side, wp in [("left", wrist_pose_left), ("right", wrist_pose_right)]:
+                if wp is None or side not in self.active_sides:
+                    continue
+                wr, pd, _ = self.compute_wrist_reward(wp, episode_length_buf, side=side)
+                wrist_rews.append(wr)
+                pos_dists.append(pd)
+            if wrist_rews:
+                wrist_rew = torch.stack(wrist_rews).mean(dim=0)
+                wrist_dist = torch.stack(pos_dists).mean(dim=0)
+                imi_rew = self.imi_wrist_weight * wrist_rew + (1.0 - self.imi_wrist_weight) * fingertip_rew
+                keypoint_dist = self.imi_wrist_weight * wrist_dist + (1.0 - self.imi_wrist_weight) * fingertip_dist
+            else:
+                imi_rew = fingertip_rew
+                keypoint_dist = fingertip_dist
         else:
             imi_rew = fingertip_rew
             keypoint_dist = fingertip_dist
-            
-        imi_rew *= self.imi_rew_weight
 
+        imi_rew *= self.imi_rew_weight
         rew_dict = dict(
-            kpts_dist_left=fingertip_dist_left,
-            kpts_dist_right=fingertip_dist_right,  
-            imi_rew=imi_rew, 
+            kpts_dist_left=kpt_dists_per_side.get("left"),
+            kpts_dist_right=kpt_dists_per_side.get("right"),
+            imi_rew=imi_rew,
             keypoint_dist=keypoint_dist,
         )
-        if self.imi_wrist_weight > 0.0:
-            rew_dict["wrist_pdist_left"] = pos_dist_left
-            rew_dict["wrist_pdist_right"] = pos_dist_right
-            rew_dict["wrist_rdist_left"] = rot_dist_left
-            rew_dict["wrist_rdist_right"] = rot_dist_right
-            rew_dict["wrist_rew_left"] = wrist_rew_left  
-            rew_dict["wrist_rew_right"] = wrist_rew_right 
-            rew_dict["fingertip_rew"] = fingertip_rew
-            if not self.exp_kpt_first:
-                rew_dict["fingertip_dist"] = fingertip_dist
-                
-
         if self.last_n_frame > 0:
-            # mask out rewards that are not from the last n frames
             tomask = torch.where(
-                episode_length_buf < self.demo_length - self.last_n_frame, 
-                torch.zeros(imi_rew.shape, device=task_rew.device, dtype=torch.bool),
-                torch.ones(imi_rew.shape, device=task_rew.device, dtype=torch.bool)
-                )
+                episode_length_buf < self.demo_length - self.last_n_frame,
+                torch.zeros(imi_rew.shape, device=imi_rew.device, dtype=torch.bool),
+                torch.ones(imi_rew.shape, device=imi_rew.device, dtype=torch.bool),
+            )
             imi_rew[tomask] = 0.0
         return imi_rew, rew_dict 
 
@@ -558,8 +564,8 @@ class RewardModule:
     
     def compute_matched_contact_reward(
         self,
-        contacts_link_left, # shape (N, num_obj_links, num_hand_links) 
-        contacts_link_valid_left, # shape (N, num_obj_links, num_hand_links)
+        contacts_link_left,
+        contacts_link_valid_left,
         contacts_link_right,
         contacts_link_valid_right,
         obj_pose,
@@ -568,11 +574,15 @@ class RewardModule:
     ):
         rews = dict()
         contact_rew = 0
-        for side, contacts, valids in zip(
-            ['left', 'right'],
-            [contacts_link_left, contacts_link_right],
-            [contacts_link_valid_left, contacts_link_valid_right]
-        ):
+        sides_data = [
+            ("left", contacts_link_left, contacts_link_valid_left),
+            ("right", contacts_link_right, contacts_link_valid_right),
+        ]
+        n_active = 0
+        for side, contacts, valids in sides_data:
+            if contacts is None or valids is None or side not in self.active_sides:
+                continue
+            n_active += 1
             part_dist, part_align = self.compute_matched_contact_per_hand(
                 contacts, valids, episode_length_buf, 
                 obj_pose, demo_obj_pose, side=side
@@ -613,7 +623,9 @@ class RewardModule:
                 rews[f"conrew_{side}_{part}"] = con_rew
                 rews[f"matched_condist_{side}_{part}"] = con_dist
                 contact_rew += con_rew
-        contact_rew /= 4.0
+        n_parts = 2
+        if n_active > 0:
+            contact_rew /= float(n_active * n_parts)
         contact_rew *= self.contact_rew_weight
         rews['con_rew'] = contact_rew
         
@@ -634,7 +646,7 @@ class RewardModule:
         wrist_pose_left,
         wrist_pose_right,
         contacts_link_left,
-        contacts_link_valid_left, # shape (N, num_obj_links, num_hand_links)
+        contacts_link_valid_left,
         contacts_link_right,
         contacts_link_valid_right,
         episode_length_buf,
@@ -642,24 +654,22 @@ class RewardModule:
         demo_obj_pos = self.match_demo_state("obj_pos", episode_length_buf)
         demo_obj_quat = self.match_demo_state("obj_quat", episode_length_buf)
         demo_obj_pose = torch.cat([demo_obj_pos, demo_obj_quat], dim=1)
-        contact_rew_left, contact_dict_left = self.compute_hand_contact_reward(
-            contacts_link_left, contacts_link_valid_left, 
-            wrist_pose_left, obj_pose, episode_length_buf, demo_obj_pose, side='left'
-        )
-        contact_rew_right, contact_dict_right = self.compute_hand_contact_reward(
-            contacts_link_right, contacts_link_valid_right, 
-            wrist_pose_right, obj_pose, episode_length_buf, demo_obj_pose, side='right'
-        )
-        contact_rew = (contact_rew_left + contact_rew_right) / 2.0 
-     
-        # add bonus to reward more contact points
-        # num_points = torch.sum(contacts_link_valid_left, dim=-1) + torch.sum(contacts_link_valid_right, dim=-1)
-        # more_points_rew = torch.mean(num_points.float() / 2.0, dim=-1) # average over num_links, then over batch # max is 1.0
-        # contact_rew += more_points_rew * 0.01 
-        
+        contact_rews = []
+        contact_dict = {}
+        for side, contacts, valids, wrist in [
+            ("left", contacts_link_left, contacts_link_valid_left, wrist_pose_left),
+            ("right", contacts_link_right, contacts_link_valid_right, wrist_pose_right),
+        ]:
+            if contacts is None or valids is None or side not in self.active_sides:
+                continue
+            c_rew, c_dict = self.compute_hand_contact_reward(
+                contacts, valids, wrist, obj_pose, episode_length_buf, demo_obj_pose, side=side
+            )
+            contact_rews.append(c_rew)
+            contact_dict.update(c_dict)
+        contact_rew = torch.stack(contact_rews).mean(dim=0) if contact_rews else torch.zeros(obj_pose.shape[0], device=obj_pose.device) 
         contact_rew *= self.contact_rew_weight
-        contact_dict = {**contact_dict_left, **contact_dict_right} # merge the two dicts, should have no key overlap
-        contact_dict['con_rew'] = contact_rew
+        contact_dict["con_rew"] = contact_rew
         return contact_rew, contact_dict
 
     def reshape_contact_with_label(self, contact_link_pos, contact_link_valid):

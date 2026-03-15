@@ -5,23 +5,38 @@ from dexmachina.envs.base_env import BaseEnv, get_env_cfg
 from dexmachina.envs.randomizations import get_randomization_cfg
 from dexmachina.envs.curriculum import get_curriculum_cfg
 from dexmachina.envs.maniptrans_curr import get_maniptrans_cfg
-from dexmachina.envs.object import ArticulatedObject, get_arctic_object_cfg
+from dexmachina.envs.object import ArticulatedObject, get_arctic_object_cfg, get_ycb_object_cfg
 from dexmachina.envs.robot import BaseRobot, get_default_robot_cfg
 from dexmachina.envs.rewards import RewardModule, get_reward_cfg
 from dexmachina.envs.demo_data import get_demo_data, load_genesis_retarget_data 
 
 def parse_clip_string(clip):
-    vals = clip.split('-')
+    vals = clip.split("-")
     if len(vals) == 3:
         print("Default to using subject s01 and clip 01")
-        vals += ['s01', 'u01']
+        vals += ["s01", "u01"]
     assert len(vals) == 5, "Clip should be in format: obj_name-start-end-subject-clip"
     obj_name = vals[0]
     start = int(vals[1])
     end = int(vals[2])
     subject = vals[3]
-    use_clip = vals[4].replace('u', '') # just 01/02
+    use_clip = vals[4].replace("u", "")
     return obj_name, start, end, subject, use_clip
+
+
+def parse_dexycb_clip(clip):
+    """Parse DexYCB clip: subject/sequence_id-start-end -> subject_name, sequence_id, start, end."""
+    parts = clip.split("-")
+    if len(parts) != 3:
+        raise ValueError("DexYCB clip must be subject/sequence_id-start-end")
+    subject_seq = parts[0]
+    start, end = int(parts[1]), int(parts[2])
+    if "/" in subject_seq:
+        subject_name, sequence_id = subject_seq.split("/", 1)
+    else:
+        subject_name = subject_seq
+        sequence_id = subject_seq
+    return subject_name, sequence_id, start, end
 
 def get_all_env_cfg(args, device, load_retarget_data=True):
     num_envs = args.num_envs  
@@ -64,36 +79,56 @@ def get_all_env_cfg(args, device, load_retarget_data=True):
     reward_cfg['multiply_all_rew'] = args.multiply_all_rew
     
     assert args.clip is not None, "Please provide a clip name"
-    obj_name, start, end, subject, use_clip = parse_clip_string(args.clip)
+    data_source = getattr(args, "data_source", "arctic")
+    hand_sides_arg = getattr(args, "hand_sides", None)
+
+    if data_source == "dexycb":
+        subject, sequence_id, start, end = parse_dexycb_clip(args.clip)
+        obj_name = sequence_id
+        use_clip = "01"
+    else:
+        obj_name, start, end, subject, use_clip = parse_clip_string(args.clip)
+        sequence_id = None
+
     args.arctic_object = obj_name
     args.frame_start = start
     args.frame_end = end
-    
+
     retarget_data = dict()
     if args.use_teleop and load_retarget_data:
-        raise NotImplementedError("Teleoperation data loading is not implemented yet.") 
+        raise NotImplementedError("Teleoperation data loading is not implemented yet.")
     else:
-        if load_retarget_data: 
+        if load_retarget_data:
             print(f"Loading retarget data for {args.arctic_object}")
             _, retarget_data = load_genesis_retarget_data(
                 obj_name=args.arctic_object,
                 hand_name=args.hand,
-                frame_start=start, 
+                frame_start=start,
                 frame_end=end,
                 save_name=args.retarget_name,
                 use_clip=use_clip,
                 subject_name=subject,
-            ) 
+                hand_sides=hand_sides_arg,
+            )
         demo_data = get_demo_data(
             obj_name=args.arctic_object,
             hand_name=args.hand,
-            frame_start=start, 
+            frame_start=start,
             frame_end=end,
             use_clip=use_clip,
             subject_name=subject,
             load_retarget_contact=args.use_retarget_contact,
-        ) 
-    
+            hand_sides=hand_sides_arg,
+            data_source=data_source,
+            sequence_id=sequence_id,
+        )
+
+    hand_sides = hand_sides_arg
+    if hand_sides is None:
+        hand_sides = list(retarget_data.keys()) if retarget_data else ["left", "right"]
+    if not hand_sides:
+        hand_sides = ["left", "right"]
+
     ep_len = int(int(end) - int(start))
     if args.interp > 1:
         raise NotImplementedError("Interpolation is not implemented yet for retarget data.") 
@@ -151,26 +186,32 @@ def get_all_env_cfg(args, device, load_retarget_data=True):
             print(f"Using white plane for raytracing")
             env_cfg['plane_urdf_path'] = 'assets/plane/plane_custom.urdf'
         env_cfg["max_video_frames"] = int(2 * ep_len)
-    robot_cfgs = {
-        'left': get_default_robot_cfg(name=args.hand, side='left'),
-        'right': get_default_robot_cfg(name=args.hand, side='right')
-    }
-    for side in ['left', 'right']: 
-        robot_cfgs[side]['action_mode'] = args.action_mode
-        robot_cfgs[side]['hybrid_scales'] = tuple(args.hybrid_scales)
-        robot_cfgs[side]['res_cap'] = args.res_cap
-        robot_cfgs[side]['show_keypoints'] = args.show_kpts
-        if args.action_mode == 'policy_residual':
+    robot_cfgs = {}
+    for side in hand_sides:
+        robot_cfgs[side] = get_default_robot_cfg(name=args.hand, side=side)
+        robot_cfgs[side]["action_mode"] = args.action_mode
+        robot_cfgs[side]["hybrid_scales"] = tuple(args.hybrid_scales)
+        robot_cfgs[side]["res_cap"] = args.res_cap
+        robot_cfgs[side]["show_keypoints"] = args.show_kpts
+        if args.action_mode == "policy_residual":
             assert args.base_policy_path is not None, "Must provide --base_policy_path for policy_residual mode"
-            robot_cfgs[side]['base_policy_path'] = args.base_policy_path
+            robot_cfgs[side]["base_policy_path"] = args.base_policy_path
         if args.hide_hand:
-            robot_cfgs[side]['visualization'] = False
+            robot_cfgs[side]["visualization"] = False
 
     obj_name = args.arctic_object
-    object_cfgs = {
-        obj_name: get_arctic_object_cfg(name=obj_name, convexify=args.convexify_object, texture_mesh=args.texture_object)
-    } 
-    if args.actuate_object:
+    if data_source == "dexycb":
+        from dexmachina.envs.object import YCB_CLASS_NAMES
+
+        ycb_class = demo_data.get("ycb_class_name")
+        if not ycb_class or ycb_class not in YCB_CLASS_NAMES:
+            ycb_class = args.arctic_object if args.arctic_object in YCB_CLASS_NAMES else "002_master_chef_can"
+        object_cfgs = {obj_name: get_ycb_object_cfg(ycb_class)}
+    else:
+        object_cfgs = {
+            obj_name: get_arctic_object_cfg(name=obj_name, convexify=args.convexify_object, texture_mesh=args.texture_object)
+        }
+    if args.actuate_object and data_source != "dexycb":
         object_cfgs[obj_name]['actuated'] = True
         object_cfgs[obj_name]['kp'] = args.kp_init 
         object_cfgs[obj_name]['kv'] = args.kv_init
@@ -293,8 +334,10 @@ def get_common_argparser():
     parser.add_argument('--n_envs_per_row', '-nrow', type=int, default=None)
     parser.add_argument('--texture_object', '-to', action='store_true', help='Show texture for the object and hide the actual URDF') 
 
-    parser.add_argument('--arctic_object', '-ao', type=str, default='box')
-    parser.add_argument('--hand', type=str, default='inspire_hand')
+    parser.add_argument("--data_source", type=str, default="arctic", choices=["arctic", "dexycb"])
+    parser.add_argument("--hand_sides", type=str, nargs="+", default=None, help="e.g. right or left right")
+    parser.add_argument("--arctic_object", "-ao", type=str, default="box")
+    parser.add_argument("--hand", type=str, default="inspire_hand")
     parser.add_argument('--frame_start', '-fs', type=int, default=40)
     parser.add_argument('--frame_end', '-fe', type=int, default=200)
     parser.add_argument('--clip', '-cl', type=str, default="box-40-200-s01-u01")

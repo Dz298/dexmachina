@@ -13,10 +13,12 @@ import xml.etree.ElementTree as ET
 from sklearn.neighbors import KDTree 
 from copy import deepcopy
 from collections import defaultdict
-from dexmachina.envs.object import ArticulatedObject, get_arctic_object_cfg 
+from dexmachina.envs.object import ArticulatedObject, RigidObject, get_arctic_object_cfg, get_ycb_object_cfg
 from dexmachina.envs.math_utils import matrix_from_quat
+from dexmachina.envs.demo_data import _infer_hand_sides_from_world_coord
 
 from dexmachina.asset_utils import get_asset_path
+from dexmachina.retargeting.coordinate_utils import apply_dexycb_display_to_processed_and_retargeter
 """
 
 python retargeting/map_contacts.py --hand allegro_hand --show_object  --num_markers 100  --record_video # --raytrace
@@ -77,7 +79,8 @@ def render_transparent_img(cam):
     img = np.concatenate([img, channel[:, :, None]], axis=-1)
     return img, rgb_img
 
-def create_scene(args, object_name, urdfs, num_raw_contact_markers=50, num_grouped_contact_markers=50):
+def create_scene(args, object_name, urdfs, num_raw_contact_markers=50, num_grouped_contact_markers=50,
+                object_cfg=None, object_cls=None):
     import genesis as gs
     gs.init(backend=gs.gpu)
     scene_cfg = dict(
@@ -153,22 +156,22 @@ def create_scene(args, object_name, urdfs, num_raw_contact_markers=50, num_group
         )
         hand_entities[side] = hand 
     obj = None
-    if args.show_object:
-        obj_cfg = get_arctic_object_cfg(object_name)
-        obj_cfg['fixed'] = False
-        obj_cfg['disable_collision'] = True
-        obj_cfg['color'] = (1.0, 0.423, 0.039, 0.3)
-        obj = ArticulatedObject(obj_cfg, device=device, scene=scene, num_envs=1, disable_collision=True)
+    if args.show_object and object_cfg is not None and object_cls is not None:
+        obj_cfg = object_cfg.copy()
+        obj_cfg["fixed"] = False
+        obj_cfg["disable_collision"] = True
+        obj_cfg["color"] = (1.0, 0.423, 0.039, 0.3)
+        obj = object_cls(obj_cfg, device=device, scene=scene, num_envs=1)
     markers = dict()
     if args.show_grouped_contact_only:
         num_raw_contact_markers = 0
+    mesh_parts = ["base"] if (object_cls is not None and object_cls == RigidObject) else ["top", "bottom"]
     for palette, marker_type, num_markers in zip(['rocket', 'crest'],['raw', 'grouped'], [num_raw_contact_markers, num_grouped_contact_markers]):
         if num_markers > 0:
             import seaborn as sns
-            marker_colors = sns.color_palette(palette, 2)
+            marker_colors = sns.color_palette(palette, max(2, len(mesh_parts)))
             marker_colors = np.array(marker_colors)
-            
-            for i, part in enumerate(['top', 'bottom']):
+            for i, part in enumerate(mesh_parts):
                 color = marker_colors[i]
                 
                 marker_ents = [
@@ -491,14 +494,20 @@ if __name__ == "__main__":
     subject_name = args.load_fname.split("/")[-2]
     hand_name = args.hand if 'hand' in args.hand else f"{args.hand}_hand"
     retarget_type = 'position' if hand_name == 'shadow_hand' else 'vector'
-    retarget_fname = join(
-        f"assets/retargeter_results/{hand_name}/{subject_name}", 
-        args.load_fname.split("/")[-1].replace(".npy", f"_{retarget_type}.npy")
-    )
+    retarget_fname = str(get_asset_path(join("retargeter_results", hand_name, subject_name, args.load_fname.split("/")[-1].replace(".npy", f"_{retarget_type}.npy"))))
     assert os.path.exists(retarget_fname), f"retarget_fname={retarget_fname} does not exist"
 
     retargeter_results = np.load(retarget_fname, allow_pickle=True).item()
-    object_name = args.load_fname.split("/")[-1].split("_")[0]
+    loaded_data = np.load(args.load_fname, allow_pickle=True).item()
+    apply_dexycb_display_to_processed_and_retargeter(loaded_data, retargeter_results)
+    if "ycb_class_name" in loaded_data.get("params", {}):
+        object_name = str(loaded_data["params"]["ycb_class_name"])
+        object_cfg = get_ycb_object_cfg(object_name)
+        object_cls = ArticulatedObject
+    else:
+        object_name = args.load_fname.split("/")[-1].split("_")[0]
+        object_cfg = get_arctic_object_cfg(object_name)
+        object_cls = ArticulatedObject
 
     full_save_dir = get_asset_path(args.save_dir)
     save_path = os.path.join(full_save_dir, hand_name, subject_name)
@@ -507,36 +516,34 @@ if __name__ == "__main__":
         frame_path = os.path.join(save_path, f"frames_{object_name}")
         os.makedirs(frame_path, exist_ok=True)
     save_fname = os.path.join(save_path, args.load_fname.split("/")[-1])
-    loaded_data = np.load(args.load_fname, allow_pickle=True).item() 
+    world_coord = loaded_data["world_coord"]
+    hand_sides = _infer_hand_sides_from_world_coord(world_coord)
 
     obj_states = {
-        "root_pos": loaded_data['params']['obj_trans'],
-        "root_quat": loaded_data['params']['obj_quat'],
-        "joint_qpos": loaded_data['params']['obj_arti'],
+        "root_pos": loaded_data["params"]["obj_trans"],
+        "root_quat": loaded_data["params"]["obj_quat"],
+        "joint_qpos": loaded_data["params"]["obj_arti"],
     }
     mesh_helper = ArcticObjectMeshHelper(object_name)
 
     if args.show_mano_plt:
-        contacts_left = loaded_data['world_coord']["contact_links_left"]
-        contacts_right = loaded_data['world_coord']["contact_links_right"]
-        show_contact_plt(
-            np.concatenate([contacts_left, contacts_right], axis=1)
-        )
+        contact_links = [world_coord[f"contact_links_{s}"] for s in hand_sides]
+        show_contact_plt(np.concatenate(contact_links, axis=1))
         breakpoint()
-        
 
     urdfs = dict()
     robot_dir = get_asset_path(args.hand)
-    config_path = join(robot_dir, "retarget_config.yaml") 
-    for side in ['left', 'right']:
-        config = yaml.safe_load(open(config_path, 'r'))
-        urdf_path = config[side]['urdf_path']
+    config_path = join(robot_dir, "retarget_config.yaml")
+    config = yaml.safe_load(open(config_path, "r"))
+    for side in hand_sides:
+        urdf_path = config[side]["urdf_path"]
         urdfs[side] = join(robot_dir, urdf_path)  
     
     # use genesis to create hand entities
     scene, hand_entities, markers, obj, cam = create_scene(
-        args, object_name, urdfs, 
-        num_raw_contact_markers=args.num_markers, num_grouped_contact_markers=args.num_markers, 
+        args, object_name, urdfs,
+        num_raw_contact_markers=args.num_markers, num_grouped_contact_markers=args.num_markers,
+        object_cfg=object_cfg, object_cls=object_cls,
     )
     device = torch.device('cuda:0')
     if args.show_hand_links: 
@@ -549,15 +556,12 @@ if __name__ == "__main__":
         links = [link for link in hand.links if link.geoms]
         collision_links[side] = links
     
-    num_steps = retargeter_results['left']["hand_qpos"].shape[0]
+    num_steps = retargeter_results[hand_sides[0]]["hand_qpos"].shape[0]
     step = 0
     frames = []
     saved_vid = False
-    clip_name = args.load_fname.split('/')[-1].replace('.npy', "")
-    tosave = dict(
-        left=defaultdict(list),
-        right=defaultdict(list),
-    )
+    clip_name = args.load_fname.split("/")[-1].replace(".npy", "")
+    tosave = {side: defaultdict(list) for side in hand_sides}
     saved_contacts = False
     while True:
         set_entities_to_step(hand_entities, retargeter_results, step) 
@@ -632,7 +636,8 @@ if __name__ == "__main__":
         if step >= num_steps:
             step = 0
             if not saved_contacts:
-                for side, data in tosave.items():
+                for side in hand_sides:
+                    data = tosave[side]
                     for key, val in data.items():
                         val = np.stack(val, axis=0)
                         tosave[side][key] = val

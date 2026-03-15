@@ -11,20 +11,37 @@ from pathlib import Path
 from copy import deepcopy
 
 from dexmachina.asset_utils import get_asset_path
-from dexmachina.envs.demo_data import get_demo_data 
+from dexmachina.envs.demo_data import get_demo_data, _infer_hand_sides_from_world_coord
 from dexmachina.envs.base_env import BaseEnv, get_env_cfg
-from dexmachina.envs.robot import BaseRobot, get_default_robot_cfg 
-from dexmachina.envs.object import ArticulatedObject, get_arctic_object_cfg
-from dexmachina.envs.constructors import get_common_argparser, parse_clip_string  
+from dexmachina.envs.robot import BaseRobot, get_default_robot_cfg
+from dexmachina.envs.object import ArticulatedObject, get_arctic_object_cfg, get_ycb_object_cfg
+from dexmachina.envs.constructors import get_common_argparser, parse_clip_string
 from dexmachina.retargeting.retarget_utils import compose_retarget_config, retarget_all_steps
 
 # need `pip install dex-retargeting`
 from dex_retargeting.retargeting_config import RetargetingConfig
 from dex_retargeting.kinematics_adaptor import KinematicAdaptor, MimicJointKinematicAdaptor
 
-PROCESSED_DATADIR=get_asset_path("arctic/processed")
-RETARGET_DIR=get_asset_path("retargeted")
-RETARGETER_RESULTS_DIR=get_asset_path("retargeter_results")
+PROCESSED_DATADIR = get_asset_path("arctic/processed")
+DEXYCB_PROCESSED_DIR = get_asset_path("dexycb/processed")
+RETARGET_DIR = get_asset_path("retargeted")
+RETARGETER_RESULTS_DIR = get_asset_path("retargeter_results")
+
+
+def parse_dexycb_clip(clip):
+    """Parse DexYCB clip: subject/sequence_id-start-end -> subject_name, sequence_id, start, end.
+    Subject can contain hyphens (e.g. 20200709-subject-01), so we parse start/end from the right."""
+    parts = clip.split("-")
+    if len(parts) < 3:
+        raise ValueError("DexYCB clip must be subject/sequence_id-start-end")
+    start, end = int(parts[-2]), int(parts[-1])
+    subject_seq = "-".join(parts[:-2])
+    if "/" in subject_seq:
+        subject_name, sequence_id = subject_seq.split("/", 1)
+    else:
+        subject_name = subject_seq
+        sequence_id = subject_seq
+    return subject_name, sequence_id, start, end
 
 def create_scene(
     num_envs, 
@@ -64,13 +81,14 @@ def create_scene(
         show_viewer=vis,
         show_FPS=False,
     )
-    if group_collisions: 
-        scene_cfg['rigid_options'].enable_self_collision = True
-        scene_cfg['rigid_options'].self_collision_group_filter = True
-        collision_groups = robot_cfgs['left'].get('collision_groups', dict())
-        print('Setting the SAME collision grouping to both hands')
+    if group_collisions:
+        scene_cfg["rigid_options"].enable_self_collision = True
+        scene_cfg["rigid_options"].self_collision_group_filter = True
+        first_cfg = next(iter(robot_cfgs.values()))
+        collision_groups = first_cfg.get("collision_groups", dict())
+        print("Setting the SAME collision grouping to both hands")
         print(collision_groups)
-        scene_cfg['rigid_options'].link_group_mapping = collision_groups
+        scene_cfg["rigid_options"].link_group_mapping = collision_groups
     if enable_self_collision:
         print("Enabling self collision, will slow down simulation")
         scene_cfg['rigid_options'].enable_self_collision
@@ -121,7 +139,7 @@ def create_scene(
         ) 
     for k, cfg in object_cfgs.items():
         objects[k] = ArticulatedObject(
-            cfg, 
+            cfg,
             device=device,
             scene=scene,
             num_envs=num_envs,
@@ -146,70 +164,117 @@ def create_scene(
 
     return scene, robots, obj, camera
 
-def prepare_cfgs(args, hand_name, obj_name, start, end, subject_name, use_clip):
+def prepare_cfgs(
+    args,
+    hand_name,
+    obj_name,
+    start,
+    end,
+    subject_name,
+    use_clip,
+    hand_sides=None,
+    data_source="arctic",
+    input_fname=None,
+    sequence_id=None,
+):
     start = int(start)
     end = int(end)
     demo_data = get_demo_data(
         obj_name=obj_name,
         hand_name=hand_name,
-        frame_start=start, 
+        frame_start=start,
         frame_end=end,
         use_clip=use_clip,
         subject_name=subject_name,
+        hand_sides=hand_sides,
+        data_source=data_source,
+        data_fname=input_fname,
+        sequence_id=sequence_id,
     )
-    obj_cfg = get_arctic_object_cfg(name=obj_name, convexify=False)
+    if data_source == "dexycb":
+        loaded = np.load(input_fname, allow_pickle=True).item()
+        ycb_class = loaded.get("params", {}).get("ycb_class_name", "002_master_chef_can")
+        obj_cfg = get_ycb_object_cfg(str(ycb_class))
+        # Trimmed .npy may have fewer frames than clip range; use actual length
+        actual_len = demo_data["obj_pos"].shape[0]
+        num_envs = min(end - start, actual_len)
+        if num_envs < end - start:
+            print(f"[INFO] DexYCB: using {num_envs} frames (clip requested {end - start}, data has {actual_len})")
+    else:
+        obj_cfg = get_arctic_object_cfg(name=obj_name, convexify=False)
+        num_envs = end - start
     print("Setting object base to fixed and collect data to True")
-    obj_cfg['fixed'] = True
-    obj_cfg['collect_data'] = True
-    object_cfgs = {
-        obj_name: obj_cfg,
-    } 
-    
+    obj_cfg["fixed"] = True
+    obj_cfg["collect_data"] = obj_cfg.get("object_type") != "ycb"
+    object_cfgs = {obj_name: obj_cfg}
+
+    if hand_sides is None:
+        hand_sides = ["left", "right"]
     robot_cfgs = dict()
     print("Setting action mode to absolute and setting collect_data to True")
-    for side in ['left', 'right']:
+    for side in hand_sides:
         _cfg = get_default_robot_cfg(name=hand_name, side=side)
-        _cfg['action_mode'] = 'absolute'
-        _cfg['collect_data'] = True 
+        _cfg["action_mode"] = "absolute"
+        _cfg["collect_data"] = True
         robot_cfgs[side] = _cfg
-
-    num_envs = end - start
     kwargs = {
-        'num_envs': num_envs,
-        'robot_cfgs': robot_cfgs,
-        'object_cfgs': object_cfgs,
-        'demo_data': demo_data,
-        'vis': args.vis,
-        'record_video': args.record_video,
-        'render_image': args.render_image,
+        "num_envs": num_envs,
+        "robot_cfgs": robot_cfgs,
+        "object_cfgs": object_cfgs,
+        "demo_data": demo_data,
+        "vis": args.vis,
+        "record_video": args.record_video,
+        "render_image": args.render_image,
         "n_rendered_envs": args.n_render,
         "group_collisions": args.group_collisions,
         "enable_self_collision": args.enable_self_collision,
+        "hand_sides": hand_sides,
+        "input_fname": input_fname,
     }
-    return kwargs 
+    return kwargs
 
-def prepare_retarget_cfgs(args, hand_name, obj_name, robot_cfgs, subject_name="s01", use_clip="01"):
-    if 'mano' in hand_name:
-        config_path = "assets/mano_hand/retarget_config.yaml"
-        robot_dir = "mano-urdf"
+def prepare_retarget_cfgs(
+    args,
+    hand_name,
+    obj_name,
+    robot_cfgs,
+    subject_name="s01",
+    use_clip="01",
+    hand_sides=None,
+    input_fname=None,
+):
+    if input_fname is None:
+        input_fname = join(PROCESSED_DATADIR, f"{subject_name}/{obj_name}_use_{use_clip}.npy")
+    input_fname = str(input_fname)
+    assert os.path.exists(input_fname), f"Input file {input_fname} does not exist"
+    loaded = np.load(input_fname, allow_pickle=True).item()
+    print(f"Loaded data from {input_fname}")
+    world_data = loaded["world_coord"]
+
+    if hand_sides is None:
+        hand_sides = _infer_hand_sides_from_world_coord(world_data)
+
+    if "mano" in hand_name:
+        config_path = get_asset_path("mano_hand/retarget_config.yaml")
+        robot_dir = Path("mano-urdf")
     else:
-        config_path = f"assets/{hand_name}/retarget_config.yaml"
-        robot_dir = f"assets/{hand_name}"
+        config_path = get_asset_path(f"{hand_name}/retarget_config.yaml")
+        robot_dir = get_asset_path(hand_name)
     RetargetingConfig.set_default_urdf_dir(str(robot_dir))
-    with Path(config_path).open('r') as f:
+    with Path(config_path).open("r") as f:
         input_cfg = yaml.safe_load(f)
     print(f"Start retargeting with config {config_path}")
     retarget_type = args.retarget_type
-    if 'shadow' in hand_name:
-        retarget_type = 'position'
-        print(f"Setting retarget type to position for shadow")
+    if "shadow" in hand_name:
+        retarget_type = "position"
+        print("Setting retarget type to position for shadow")
     low_pass_alpha = input_cfg.get("low_pass_alpha", 1.0)
     scaling_factor = input_cfg.get("scaling_factor", 1.0)
     ignore_mimic_joint = input_cfg.get("ignore_mimic_joint", False)
     add_dummy_free_joint = input_cfg.get("ignore_mimic_joint", False)
-    print(f'NOTE: getting kpt link names directly from collison links in Genesis entity! ')
+    print("NOTE: getting kpt link names directly from collison links in Genesis entity!")
     retargeters = dict()
-    for side in ['left', 'right']:
+    for side in hand_sides:
         config_dict = compose_retarget_config(
             input_cfg[side],
             retarget_type,
@@ -217,27 +282,20 @@ def prepare_retarget_cfgs(args, hand_name, obj_name, robot_cfgs, subject_name="s
             scaling_factor,
             ignore_mimic_joint,
             add_dummy_free_joint,
-        ) 
-        retarget_cfg = RetargetingConfig.from_dict(
-            deepcopy(config_dict)
         )
-        retargeters[side] = retarget_cfg.build() 
-        target_origin_link = input_cfg[side]['target_origin_link'] 
-        urdf_path = config_dict['urdf_path']
-
+        retarget_cfg = RetargetingConfig.from_dict(deepcopy(config_dict))
+        retargeters[side] = retarget_cfg.build()
+        target_origin_link = input_cfg[side]["target_origin_link"]
+        urdf_path = config_dict["urdf_path"]
         robot_cfg = robot_cfgs[side]
-        if 'inspire' not in hand_name and 'ability' not in hand_name and 'schunk' not in hand_name: # exceptions for hands with mimic joints
-            assert str(robot_cfg['urdf_path']).split('/')[-1]  == urdf_path.split('/')[-1], f"Retargeting and robot should use the same URDF path, got {robot_cfg['urdf_path']} and {urdf_path}"
-        # also check wrist link name is the same! 
-        assert robot_cfg['wrist_link_name'] == target_origin_link,   f"Retargeting and robot should use the same wrist link name"
-    
-  
-    input_fname = f"{subject_name}/{obj_name}_use_{use_clip}.npy"
-    input_fname = join(PROCESSED_DATADIR, input_fname)
-    assert os.path.exists(input_fname), f"Input file {input_fname} does not exist" 
-    loaded = np.load(input_fname, allow_pickle=True).item() 
-    print(f"Loaded data from {input_fname}")
-    world_data = loaded["world_coord"]  
+        if "inspire" not in hand_name and "ability" not in hand_name and "schunk" not in hand_name:
+            assert str(robot_cfg["urdf_path"]).split("/")[-1] == urdf_path.split("/")[-1], (
+                f"Retargeting and robot should use the same URDF path, "
+                f"got {robot_cfg['urdf_path']} and {urdf_path}"
+            )
+        assert robot_cfg["wrist_link_name"] == target_origin_link, (
+            f"Retargeting and robot should use the same wrist link name"
+        )
 
     return retargeters, world_data, input_fname
 
@@ -247,8 +305,9 @@ def set_init_object_states(obj, obj_pos, obj_quat, obj_arti, joint_only=False):
     assert num_demo_steps == obj.num_envs, f"Number of demo steps {num_demo_steps} should match number of envs {obj.num_envs}"
     env_idxs = [i for i in range(obj.num_envs)]   
     if joint_only:
-        obj.entity.set_dofs_position(position=obj_arti, dofs_idx_local=obj.dof_idxs, zero_velocity=True, envs_idx=env_idxs)
-        return 
+        if len(obj.dof_idxs) > 0:
+            obj.entity.set_dofs_position(position=obj_arti, dofs_idx_local=obj.dof_idxs, zero_velocity=True, envs_idx=env_idxs)
+        return
     obj.set_object_state(
         root_pos=obj_pos,
         root_quat=obj_quat,
@@ -262,18 +321,16 @@ def get_obj_demo_tensors(demo_data, device=torch.device("cuda")):
     obj_arti = torch.tensor(demo_data['obj_arti'], device=device)[:, None] # shape (num_demo_steps, 1)
     return obj_pos, obj_quat, obj_arti
 
-def set_hand_to_step(hands, retar_data, step, env_idxs=None): 
-    for side in ['left', 'right']:
-        hand = hands[side] 
+def set_hand_to_step(hands, retar_data, step, env_idxs=None):
+    for side, hand in hands.items():
         if env_idxs is None:
             env_idxs = [i for i in range(hand.num_envs)]
         num_envs = len(env_idxs)
-        hand_qpos, wrist_qpos, wrist_idxs = [retar_data[side][key][step] for key in ['hand_qpos', 'wrist_qpos', 'wrist_idxs']] 
+        hand_qpos, wrist_qpos, wrist_idxs = [
+            retar_data[side][key][step] for key in ["hand_qpos", "wrist_qpos", "wrist_idxs"]
+        ]
         hand_qpos = torch.tensor(hand_qpos).to(hand.init_qpos.device).unsqueeze(0).repeat(num_envs, 1)
-        hand.set_joint_position(
-            hand_qpos,
-            env_idxs=env_idxs,
-        )
+        hand.set_joint_position(hand_qpos, env_idxs=env_idxs)
     return
 
 def prepare_robot_actions(hand, side_retar_data):
@@ -332,19 +389,58 @@ def get_retargeter_save_fname(args, hand_name, input_fname, retarget_type, subje
     save_fname = os.path.join(save_dir, traj_name.replace(".npy", f"_{retarget_type}.npy"))
     return save_fname
  
-def main(args): 
-    obj_name, start, end, subject_name, use_clip = parse_clip_string(args.clip)
-    hand_name = args.hand if "hand" in args.hand else f"{args.hand}_hand" 
-    kwargs = prepare_cfgs(
-        args, hand_name, obj_name, start, end, subject_name, use_clip
-        )
-    retargeters, world_data, input_fname  = prepare_retarget_cfgs(
-        args, hand_name, obj_name, kwargs['robot_cfgs'], subject_name, use_clip)
-    retarget_type = args.retarget_type if 'shadow' not in hand_name else 'position'
+def main(args):
+    data_source = getattr(args, "data_source", "arctic")
+    if data_source == "dexycb":
+        subject_name, sequence_id, start, end = parse_dexycb_clip(args.clip)
+        obj_name = sequence_id
+        use_clip = "01"
+        input_fname = join(DEXYCB_PROCESSED_DIR, subject_name, f"{sequence_id}.npy")
+        input_fname = str(input_fname)
+    else:
+        obj_name, start, end, subject_name, use_clip = parse_clip_string(args.clip)
+        sequence_id = None
+        input_fname = join(PROCESSED_DATADIR, f"{subject_name}/{obj_name}_use_{use_clip}.npy")
+        input_fname = str(input_fname)
 
-    assert not (args.replay_only and args.save), "Cannot save and replay at the same time" 
+    if os.path.exists(input_fname):
+        loaded = np.load(input_fname, allow_pickle=True).item()
+        hand_sides = _infer_hand_sides_from_world_coord(loaded["world_coord"])
+    else:
+        hand_sides = getattr(args, "hand_sides", None) or ["left", "right"]
+
+    hand_name = args.hand if "hand" in args.hand else f"{args.hand}_hand"
+    kwargs = prepare_cfgs(
+        args,
+        hand_name,
+        obj_name,
+        start,
+        end,
+        subject_name,
+        use_clip,
+        hand_sides=hand_sides,
+        data_source=data_source,
+        input_fname=input_fname,
+        sequence_id=sequence_id,
+    )
+    hand_sides = kwargs["hand_sides"]
+    retargeters, world_data, input_fname = prepare_retarget_cfgs(
+        args,
+        hand_name,
+        obj_name,
+        kwargs["robot_cfgs"],
+        subject_name,
+        use_clip,
+        hand_sides=hand_sides,
+        input_fname=input_fname,
+    )
+    retarget_type = args.retarget_type if "shadow" not in hand_name else "position"
+
+    assert not (args.replay_only and args.save), "Cannot save and replay at the same time"
     save_fname = get_save_fname(args, hand_name, input_fname, retarget_type, subject_name)
-    retargeter_save_fname = get_retargeter_save_fname(args, hand_name, input_fname, retarget_type, subject_name)
+    retargeter_save_fname = get_retargeter_save_fname(
+        args, hand_name, input_fname, retarget_type, subject_name
+    )
     if not args.overwrite and os.path.exists(save_fname) and not args.save_retargeter_only and not args.replay_only:
         print(f"File {save_fname} already exists, use --overwrite to overwrite")
         breakpoint()
@@ -361,8 +457,9 @@ def main(args):
             else:
                 loaded_data = np.load(save_fname, allow_pickle=True).item()
 
-    gs.init(backend=gs.gpu)  
-    scene, hands, obj, cam = create_scene(**kwargs) 
+    gs.init(backend=gs.gpu)
+    scene_kwargs = {k: v for k, v in kwargs.items() if k in ("num_envs", "robot_cfgs", "object_cfgs", "demo_data", "vis", "record_video", "render_image", "n_rendered_envs", "group_collisions", "enable_self_collision")}
+    scene, hands, obj, cam = create_scene(**scene_kwargs)
     num_envs = kwargs['num_envs'] 
 
     if args.replay_only:
@@ -395,8 +492,8 @@ def main(args):
             return
     
     device = torch.device("cuda")
-    hand_actions = {side: prepare_robot_actions(hands[side], retar_data[side]) for side in ['left', 'right']}
-    hand_qposes = {side: torch.tensor(retar_data[side]['hand_qpos'], device=device) for side in ['left', 'right']}
+    hand_actions = {side: prepare_robot_actions(hands[side], retar_data[side]) for side in hand_sides}
+    hand_qposes = {side: torch.tensor(retar_data[side]["hand_qpos"], device=device) for side in hand_sides}
     demo_data = kwargs['demo_data']
     obj_pos, obj_quat, obj_arti = get_obj_demo_tensors(demo_data, device=device)
     set_init_object_states(obj, obj_pos, obj_quat, obj_arti, joint_only=False)
@@ -415,15 +512,14 @@ def main(args):
         render_frames.append(img)
         
     
-    # for each env idx, set the initial object pose to the demo step 
-    iters = 0
-    controlled_steps = {side: torch.zeros(num_envs, device=device) for side in ['left', 'right']}
+    # for each env idx, set the initial object pose to the demo step
+    controlled_steps = {side: torch.zeros(num_envs, device=device) for side in hand_sides}
     for i in range(args.control_steps):
         set_init_object_states(obj, obj_pos, obj_quat, obj_arti, joint_only=True)
-        for side in ['left', 'right']:
-            hand = hands[side] 
+        for side in hand_sides:
+            hand = hands[side]
             actions = hand_actions[side]
-            hand.step(actions) 
+            hand.step(actions)
         scene.step()
         for side, hand in hands.items():
             hand.update_value_buffers()
@@ -468,15 +564,18 @@ def main(args):
     
     data = gather_parallel_save_data(hands, retar_data)
     data['demo_data'] = demo_data
+    if data_source == "dexycb" and os.path.exists(input_fname):
+        loaded = np.load(input_fname, allow_pickle=True).item()
+        data["params"] = loaded.get("params", {})
     if args.save and (not args.replay_only):
         torch.save(data, save_fname)
         print(f"Saved data to {save_fname}")
     return 
 
-if __name__ == '__main__':
-    parser = get_common_argparser()   
-    parser.add_argument("--save_name", "-sn", type=str, default="para", help="Name of the saved file") 
-    parser.add_argument("--subject_name", type=str, default="s01") 
+if __name__ == "__main__":
+    parser = get_common_argparser()
+    parser.add_argument("--save_name", "-sn", type=str, default="para", help="Name of the saved file")
+    parser.add_argument("--subject_name", type=str, default="s01")
     parser.add_argument("--set_target", "-st", action="store_true", default=False, help="Directly set target joint positions")
     parser.add_argument("--control_steps", "-cs", type=int, default=100, help="Control joint position steps")
     parser.add_argument("--save", action="store_true", default=False, help="Save the keypoints")
