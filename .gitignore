@@ -184,3 +184,8 @@ cython_debug/
 # metrics
 *.npz
 *.json
+
+dex_ycb
+assets/
+.gitignore
+*workspace
