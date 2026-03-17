@@ -227,6 +227,7 @@ class WorldModelTrainer:
         self.obs_buffer = []
         self.action_buffer = []
         self.object_state_buffer = []
+        self.done_buffer = []
 
         # Running statistics for logging
         self.total_updates = 0
@@ -238,12 +239,14 @@ class WorldModelTrainer:
         self.obs_buffer = []
         self.action_buffer = []
         self.object_state_buffer = []
+        self.done_buffer = []
 
     def add_transition(
         self,
         obs: torch.Tensor,
         action: torch.Tensor,
         object_state: torch.Tensor,
+        done: torch.Tensor,
     ):
         """
         Add a transition to the replay buffer. Stored on CPU to save GPU memory.
@@ -253,18 +256,58 @@ class WorldModelTrainer:
             obs: (num_envs, obs_dim) - observation without latent
             action: (num_envs, action_dim)
             object_state: (num_envs, object_state_dim)
+            done: (num_envs,) boolean tensor where True marks episode termination after this transition
         """
         self.obs_buffer.append(obs.detach().cpu())
         self.action_buffer.append(action.detach().cpu())
         self.object_state_buffer.append(object_state.detach().cpu())
+        self.done_buffer.append(done.detach().cpu().to(dtype=torch.bool))
         if len(self.obs_buffer) > self.replay_capacity:
             self.obs_buffer.pop(0)
             self.action_buffer.pop(0)
             self.object_state_buffer.pop(0)
+            self.done_buffer.pop(0)
 
     def has_enough_data(self) -> bool:
         """Check if we have at least one full sequence for training."""
         return len(self.obs_buffer) >= self.rollout_length
+
+    def _sample_valid_sequence(self):
+        """
+        Sample a contiguous sequence that does not cross an episode boundary.
+
+        Returns:
+            Tuple of (obs_seq, action_seq, object_state_seq) on self.device, or None if no valid
+            per-env sequence exists in the current replay buffer.
+        """
+        if not self.has_enough_data():
+            return None
+
+        n = len(self.obs_buffer)
+        max_start = n - self.rollout_length
+        candidate_starts = list(range(max_start + 1))
+        random.shuffle(candidate_starts)
+
+        for start in candidate_starts:
+            end = start + self.rollout_length
+            obs_seq = torch.stack(self.obs_buffer[start:end], dim=1)
+            action_seq = torch.stack(self.action_buffer[start:end], dim=1)
+            object_state_seq = torch.stack(self.object_state_buffer[start:end], dim=1)
+
+            if self.rollout_length > 1:
+                done_seq = torch.stack(self.done_buffer[start:end - 1], dim=1)
+                valid_env_mask = ~done_seq.any(dim=1)
+            else:
+                valid_env_mask = torch.ones(obs_seq.shape[0], dtype=torch.bool)
+
+            if valid_env_mask.any():
+                return (
+                    obs_seq[valid_env_mask].to(self.device),
+                    action_seq[valid_env_mask].to(self.device),
+                    object_state_seq[valid_env_mask].to(self.device),
+                )
+
+        return None
 
     def train_step(self) -> Optional[Dict[str, float]]:
         """
@@ -277,16 +320,11 @@ class WorldModelTrainer:
         if not self.has_enough_data():
             return None
 
-        n = len(self.obs_buffer)
-        # Sample random start index so we get a contiguous sequence of length rollout_length
-        max_start = n - self.rollout_length
-        start = random.randint(0, max_start) if max_start > 0 else 0
-        end = start + self.rollout_length
+        sampled = self._sample_valid_sequence()
+        if sampled is None:
+            return None
 
-        # Build sequence from buffer and move to device
-        obs_seq = torch.stack(self.obs_buffer[start:end], dim=1).to(self.device)
-        action_seq = torch.stack(self.action_buffer[start:end], dim=1).to(self.device)
-        object_state_seq = torch.stack(self.object_state_buffer[start:end], dim=1).to(self.device)
+        obs_seq, action_seq, object_state_seq = sampled
 
         self.world_model.train()
         loss, loss_dict = self.world_model.compute_loss(

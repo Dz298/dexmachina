@@ -239,17 +239,25 @@ class RlGamesVecEnvWrapper(IVecEnv):
         # clip the actions
         actions = torch.clamp(actions, -self._clip_actions, self._clip_actions)
         
-        # Get observation without latent BEFORE step (for world model training)
+        # Get pre-step state for world model training targets.
         obs_before_step = None
+        object_state_before_step = None
         if self.world_model_trainer is not None:
             obs_before_step = self.env.get_obs_without_latent().clone()
+            object_state_before_step = self.env.get_object_state().clone()
         
         # perform environment step
         obs_dict, rew, terminated, truncated, extras = self.env.step(actions)
 
         # World model: collect data, train, and update latent
         if self.world_model_trainer is not None:
-            self._update_world_model(obs_before_step, actions, extras)
+            self._update_world_model(
+                obs_before_step,
+                actions,
+                object_state_before_step,
+                terminated | truncated,
+                extras,
+            )
 
         # move time out information to the extras dict
         # this is only needed for infinite horizon tasks
@@ -271,13 +279,15 @@ class RlGamesVecEnvWrapper(IVecEnv):
 
         return obs_and_states, rew, dones, extras
     
-    def _update_world_model(self, obs_before_step, actions, extras):
+    def _update_world_model(self, obs_before_step, actions, object_state_before_step, dones, extras):
         """Update world model: collect data, train, and update latent buffer."""
-        # Get object state (decoder target)
-        object_state = self.env.get_object_state()
-        
         # Add transition to buffer
-        self.world_model_trainer.add_transition(obs_before_step, actions, object_state)
+        self.world_model_trainer.add_transition(
+            obs_before_step,
+            actions,
+            object_state_before_step,
+            dones,
+        )
         self._wm_step_count += 1
         
         # Train world model when we have enough data (skip in eval_only mode)
@@ -381,4 +391,3 @@ class RlGamesGpuEnv(IVecEnv):
             The Gym spaces for the environment.
         """
         return self.env.get_env_info()
-
