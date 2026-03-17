@@ -79,6 +79,12 @@ def render_transparent_img(cam):
     img = np.concatenate([img, channel[:, :, None]], axis=-1)
     return img, rgb_img
 
+def _get_object_part_names(object_cfg):
+    if object_cfg is not None and object_cfg.get("object_type") == "ycb":
+        return ["object"]
+    return ["top", "bottom"]
+
+
 def create_scene(args, object_name, urdfs, num_raw_contact_markers=50, num_grouped_contact_markers=50,
                 object_cfg=None, object_cls=None):
     import genesis as gs
@@ -165,7 +171,8 @@ def create_scene(args, object_name, urdfs, num_raw_contact_markers=50, num_group
     markers = dict()
     if args.show_grouped_contact_only:
         num_raw_contact_markers = 0
-    mesh_parts = ["base"] if (object_cls is not None and object_cls == RigidObject) else ["top", "bottom"]
+    # YCB/DexYCB has one rigid surface part ("object"); ARCTIC has two articulated parts.
+    mesh_parts = _get_object_part_names(object_cfg)
     for palette, marker_type, num_markers in zip(['rocket', 'crest'],['raw', 'grouped'], [num_raw_contact_markers, num_grouped_contact_markers]):
         if num_markers > 0:
             import seaborn as sns
@@ -187,7 +194,7 @@ def create_scene(args, object_name, urdfs, num_raw_contact_markers=50, num_group
     # add this last for segmentation to work
     ground = scene.add_entity(gs.morphs.URDF(file=plane_urdf, fixed=True))
     scene.build(n_envs=1, env_spacing=(2.0, 2.0)) 
-    return scene, hand_entities, markers, obj, cam
+    return scene, hand_entities, markers, obj, cam, mesh_parts
 
 def show_hand_joints_links_plt(hand_entites): 
     import matplotlib
@@ -448,12 +455,12 @@ def set_object_to_step(obj, obj_states, step):
     )
     return
 
-def visualize_markers(markers_dict, raw_contacts, grouped_contacts):
+def visualize_markers(markers_dict, raw_contacts, grouped_contacts, part_names):
     # first set all markers to 0! avoid delays in vis
     for k, markers in markers_dict.items():
         for marker in markers:
             marker.set_pos(np.zeros((1, 3))) 
-    for i, part in enumerate(['top', 'bottom']):
+    for i, part in enumerate(part_names):
         pid = i + 1
         raw_markers = markers_dict.get(f"raw_{part}", [])
         part_mask = raw_contacts[:, 3] == pid
@@ -465,7 +472,7 @@ def visualize_markers(markers_dict, raw_contacts, grouped_contacts):
         grouped_markers = markers_dict.get(f"grouped_{part}", [])
         grouped_pos = []
         for side, contacts in grouped_contacts.items(): 
-            # contacts are shaped (2, num_links, 4)
+            # contacts are shaped (num_obj_parts, num_links, 4)
             grouped_pos.append(contacts[i, :, :3])
         grouped_pos = np.concatenate(grouped_pos, axis=0)
         for k, pos in enumerate(grouped_pos):
@@ -502,7 +509,7 @@ if __name__ == "__main__":
     apply_dexycb_display_to_processed_and_retargeter(loaded_data, retargeter_results)
     if "ycb_class_name" in loaded_data.get("params", {}):
         object_name = str(loaded_data["params"]["ycb_class_name"])
-        object_cfg = get_ycb_object_cfg(object_name)
+        object_cfg = get_ycb_object_cfg(object_name, voc_7dof=False)  # fixed base for contact mapping
         object_cls = ArticulatedObject
     else:
         object_name = args.load_fname.split("/")[-1].split("_")[0]
@@ -540,7 +547,7 @@ if __name__ == "__main__":
         urdfs[side] = join(robot_dir, urdf_path)  
     
     # use genesis to create hand entities
-    scene, hand_entities, markers, obj, cam = create_scene(
+    scene, hand_entities, markers, obj, cam, obj_part_names = create_scene(
         args, object_name, urdfs,
         num_raw_contact_markers=args.num_markers, num_grouped_contact_markers=args.num_markers,
         object_cfg=object_cfg, object_cls=object_cls,
@@ -562,6 +569,7 @@ if __name__ == "__main__":
     saved_vid = False
     clip_name = args.load_fname.split("/")[-1].replace(".npy", "")
     tosave = {side: defaultdict(list) for side in hand_sides}
+    num_obj_parts = len(obj_part_names)
     saved_contacts = False
     while True:
         set_entities_to_step(hand_entities, retargeter_results, step) 
@@ -591,7 +599,7 @@ if __name__ == "__main__":
                 ),
             )
             hand_link_contacts, hand_link_valids, target_positions = group_contacts(
-                collision_links[side], raw_contacts[step], valid_contacts[step]
+                collision_links[side], raw_contacts[step], valid_contacts[step], num_obj_parts=num_obj_parts
             )
             hand_link_contacts_local, hand_link_normals_local = group_local_contact_targets(
                 collision_links[side], raw_contacts[step], valid_contacts[step], local_positions, local_normals
@@ -608,7 +616,7 @@ if __name__ == "__main__":
 
         if args.num_markers > 0: 
             all_raw_contacts = np.concatenate([loaded_data['world_coord'][f"contacts.{side}"][step] for side in hand_entities.keys()], axis=0)
-            visualize_markers(markers, all_raw_contacts, grouped_contacts)
+            visualize_markers(markers, all_raw_contacts, grouped_contacts, obj_part_names)
             
             # set_entities_to_step(hand_entities, retargeter_results, step)
             # set_object_to_step(obj, obj_states, step)

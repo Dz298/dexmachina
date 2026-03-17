@@ -25,12 +25,13 @@ def parse_clip_string(clip):
 
 
 def parse_dexycb_clip(clip):
-    """Parse DexYCB clip: subject/sequence_id-start-end -> subject_name, sequence_id, start, end."""
+    """Parse DexYCB clip: subject/sequence_id-start-end -> subject_name, sequence_id, start, end.
+    Subject can contain hyphens (e.g. 20200709-subject-01), so we parse start/end from the right."""
     parts = clip.split("-")
-    if len(parts) != 3:
+    if len(parts) < 3:
         raise ValueError("DexYCB clip must be subject/sequence_id-start-end")
-    subject_seq = parts[0]
-    start, end = int(parts[1]), int(parts[2])
+    start, end = int(parts[-2]), int(parts[-1])
+    subject_seq = "-".join(parts[:-2])
     if "/" in subject_seq:
         subject_name, sequence_id = subject_seq.split("/", 1)
     else:
@@ -211,9 +212,9 @@ def get_all_env_cfg(args, device, load_retarget_data=True):
         object_cfgs = {
             obj_name: get_arctic_object_cfg(name=obj_name, convexify=args.convexify_object, texture_mesh=args.texture_object)
         }
-    if args.actuate_object and data_source != "dexycb":
+    if args.actuate_object:
         object_cfgs[obj_name]['actuated'] = True
-        object_cfgs[obj_name]['kp'] = args.kp_init 
+        object_cfgs[obj_name]['kp'] = args.kp_init
         object_cfgs[obj_name]['kv'] = args.kv_init
         object_cfgs[obj_name]['force_range'] = args.force_range_init
         print('Setting batch_dofs_info=True for actuated object')

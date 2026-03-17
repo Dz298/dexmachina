@@ -487,10 +487,14 @@ class RewardModule:
         Instead of computing point cloud reward, here we assume demo contacts and policy contacts
         are from the same set of dex hand links and hence each contact point has a matched target position in the demo 
         """ 
-        demo_contacts = self.match_demo_state(f"contact_links_{side}", episode_length_buf) 
-        # NOTE the retargeted contacts are of shape (N, num_obj_parts=2, num_links, 4), first row is 'top' and second row is 'bottom'!
-        # need to flip the order since policy contact has object link bottom first 
-        demo_contacts = demo_contacts.clone()[:, [1, 0], :, :] # (N, num_obj_links, num_hand_links, 4)
+        demo_contacts = self.match_demo_state(f"contact_links_{side}", episode_length_buf)
+        n_parts = contact_link_pos.shape[1]
+        # Demo may have 2 parts (ARCTIC top/bottom); YCB has 1 part - slice to match
+        if demo_contacts.shape[1] > n_parts:
+            demo_contacts = demo_contacts[:, :n_parts, :, :].clone()
+        # ARCTIC: retargeted contacts are (N, 2, num_links, 4), first row 'top' second 'bottom'; flip to match policy (bottom first)
+        if n_parts == 2:
+            demo_contacts = demo_contacts.clone()[:, [1, 0], :, :]
         assert demo_contacts.shape[1] == contact_link_pos.shape[1], f"Shape mismatch: {demo_contacts.shape} vs {contact_link_pos.shape}"
         assert demo_contacts.shape[2] == contact_link_pos.shape[2], f"Shape mismatch: {contact_link_pos.shape} vs {demo_contacts.shape}"
         demo_valids = demo_contacts[:, :, :, -1] > 0.0 # (part id is <= 0 if no contact)
@@ -574,6 +578,7 @@ class RewardModule:
     ):
         rews = dict()
         contact_rew = 0
+        total_part_terms = 0
         sides_data = [
             ("left", contacts_link_left, contacts_link_valid_left),
             ("right", contacts_link_right, contacts_link_valid_right),
@@ -589,8 +594,10 @@ class RewardModule:
             )
             # Get link weights (thumb-weighted if enabled)
             link_weights = self.contact_link_weights.get(side, None)
-            
-            for i, part in enumerate(['bottom', 'top']): 
+            n_parts = part_dist.shape[1]  # 2 for ARCTIC, 1 for YCB
+            part_names = ("bottom", "top") if n_parts == 2 else ("base",)
+            for i in range(n_parts):
+                part = part_names[i] if i < len(part_names) else f"part{i}"
                 con_dist = part_dist[:, i]  # shape (N, num_links)
                 a_w = part_align[:, i]
                 rews[f"contact_align_{side}_{part}"] = a_w.mean(dim=-1)
@@ -623,9 +630,9 @@ class RewardModule:
                 rews[f"conrew_{side}_{part}"] = con_rew
                 rews[f"matched_condist_{side}_{part}"] = con_dist
                 contact_rew += con_rew
-        n_parts = 2
-        if n_active > 0:
-            contact_rew /= float(n_active * n_parts)
+            total_part_terms += n_parts
+        if total_part_terms > 0:
+            contact_rew /= float(total_part_terms)
         contact_rew *= self.contact_rew_weight
         rews['con_rew'] = contact_rew
         

@@ -159,7 +159,7 @@ def main(args):
     params = loaded_data.get("params", {})
     ycb_class = params.get("ycb_class_name") or (args.obj if args.obj and "_" in args.obj and args.obj[0].isdigit() else None)
     if ycb_class:
-        obj_cfg = get_ycb_object_cfg(str(ycb_class))
+        obj_cfg = get_ycb_object_cfg(str(ycb_class), voc_7dof=False)  # fixed for viz
     else:
         obj_cfg = get_arctic_object_cfg(name=args.obj, convexify=False)
     obj_cfg['fixed'] = True  # Keep object fixed in place

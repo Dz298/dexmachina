@@ -160,7 +160,7 @@ def main(args):
         demo_data["ycb_class_name"] = str(params["ycb_class_name"])
 
     if "ycb_class_name" in params:
-        object_cfg = get_ycb_object_cfg(str(params["ycb_class_name"]))
+        object_cfg = get_ycb_object_cfg(str(params["ycb_class_name"]), voc_7dof=False)  # fixed for viz
     else:
         object_cfg = get_arctic_object_cfg(name=obj_name, convexify=False)
 

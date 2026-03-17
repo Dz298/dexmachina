@@ -3,7 +3,7 @@ import torch
 import numpy as np
 import genesis as gs 
 from dexmachina.envs.robot import BaseRobot
-from dexmachina.envs.object import ArticulatedObject, RigidObject
+from dexmachina.envs.object import ArticulatedObject
 from dexmachina.envs.rewards import RewardModule
 from dexmachina.envs.math_utils import matrix_from_quat
 from dexmachina.envs.contacts import get_filtered_contacts
@@ -292,14 +292,14 @@ class BaseEnv:
         # use retarget data to set base_init_pos, base_init_quat in obj_cfg
         self.objects = dict()
         for k, cfg in object_cfgs.items():
-            obj_cls = RigidObject if cfg.get("object_type") == "ycb" else ArticulatedObject
-            self.objects[k] = obj_cls(
+            # Use ArticulatedObject for all (including YCB/DexYCB) so object can be virtually controlled with kp/kd
+            self.objects[k] = ArticulatedObject(
                 cfg,
                 device=device,
                 scene=self.scene,
                 num_envs=self.num_envs,
                 demo_data=demo_data,
-                visualize_contact=visualize_contact if obj_cls == ArticulatedObject else False,
+                visualize_contact=visualize_contact,
                 disable_collision=cfg.get("disable_collision", False),
             )
         
@@ -308,6 +308,7 @@ class BaseEnv:
         if len(self.object_names) > 0: 
             self.object = self.objects[self.object_names[0]] # only support one object for now
         self.obj_verts = dict()
+        self.obj_mesh_parts = []
         self._setup_contact_link_metadata()
         self.n_objects = len(self.object_names) # might be 0!!
         self._setup_virtual_force_metadata()
@@ -543,6 +544,24 @@ class BaseEnv:
         if all_force_norms:
             combined = torch.cat([f.flatten() for f in all_force_norms])
             self.extras["log"]["virtual_force_mean_norm"] = combined.mean()
+
+    def _get_object_mesh_parts(self, obj: ArticulatedObject) -> List[str]:
+        # Canonical surface-part interface: DexYCB -> ["object"], ARCTIC -> ["top", "bottom"].
+        if hasattr(obj, "get_surface_part_names"):
+            parts = obj.get_surface_part_names()
+        elif hasattr(obj, "surface_link_names"):
+            parts = list(obj.surface_link_names)
+        else:
+            parts = list(getattr(obj, "link_names", ["top", "bottom"]))
+        if len(parts) == 0:
+            parts = list(getattr(obj, "link_names", []))
+        return parts
+
+    def _get_num_object_mesh_parts(self) -> int:
+        if self.n_objects != 1:
+            return 0
+        parts = self._get_object_mesh_parts(self.object)
+        return max(len(parts), 1)
             
     def build_scene(self):
         env_cfg = self.env_cfg
@@ -562,7 +581,8 @@ class BaseEnv:
         if need_obj_surface_samples:
             assert self.n_objects == 1, "Only support one object for now"
             obj = self.objects[self.object_names[0]]
-            mesh_parts = getattr(obj, "link_names", ["top", "bottom"])
+            mesh_parts = self._get_object_mesh_parts(obj)
+            self.obj_mesh_parts = mesh_parts
             self.obj_verts = {part: obj.sample_mesh_vertices(300, part) for part in mesh_parts}
             
         if self.n_objects > 0:
@@ -702,7 +722,7 @@ class BaseEnv:
             obs_dim += dim
         if self.observe_tip_dist:
             n_kpts = sum(robot.n_kpts for robot in self.robots.values())
-            obs_dim += n_kpts * 2  # because two obj parts!
+            obs_dim += n_kpts * self._get_num_object_mesh_parts()
         
         if self.observe_contact_force:
             obs_dim += self.num_obj_links * self.num_robot_links * 1 # 3 for force vec
@@ -756,7 +776,7 @@ class BaseEnv:
         self.last_actions = torch.zeros((self.num_envs, self.action_dim), device=self.device)
 
         # approximate dist from hand kpt to object surface
-        num_obj_parts = 2
+        num_obj_parts = self._get_num_object_mesh_parts()
         if self.observe_tip_dist:
             self.kpt_dists = {
                 side: torch.zeros((self.num_envs, robot.n_kpts, num_obj_parts), device=self.device)
@@ -1159,9 +1179,14 @@ class BaseEnv:
         if self.observe_tip_dist:
             assert self.n_objects == 1, "Only support one object for now"
             obj = self.objects[self.object_names[0]]
+            mesh_parts = self.obj_mesh_parts if len(self.obj_mesh_parts) > 0 else self._get_object_mesh_parts(obj)
             for side, robot in self.robots.items():
                 dists_tensor = self.kpt_dists[side]
-                for i, part in enumerate(["top", "bottom"]):
+                for i, part in enumerate(mesh_parts):
+                    if i >= dists_tensor.shape[2]:
+                        break
+                    if part not in self.obj_verts:
+                        continue
                     part_pose = obj.get_part_pose(part)
                     dists_tensor[:, :, i] = self.compute_closest_vertice_dist_single(
                         self.obj_verts[part], robot.kpt_pos, part_pose
@@ -1446,7 +1471,7 @@ class BaseEnv:
         obj = self.object
         env_idx = int(env_idx)
         part_poses = dict()
-        mesh_parts = getattr(obj, "link_names", ["top", "bottom"])
+        mesh_parts = self.obj_mesh_parts if len(self.obj_mesh_parts) > 0 else self._get_object_mesh_parts(obj)
         for part in mesh_parts:
             if part in self.obj_verts:
                 part_poses[part] = obj.get_part_pose(part)

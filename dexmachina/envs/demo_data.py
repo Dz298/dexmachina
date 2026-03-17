@@ -122,7 +122,15 @@ def load_genesis_retarget_data(
     loaded_tensor = False
     if not os.path.exists(data_fname):
         data_fname = data_fname.replace(".npy", ".pt")
-        assert os.path.exists(data_fname), f"File {data_fname} not found"
+    if not os.path.exists(data_fname):
+        # DexYCB: parallel_retarget saves as {sequence_id}_{ret_type}_{save_name}.pt (no _use_01)
+        data_fname_dexycb = f"{RETARGET_DIR}/{hand_name}/{subject_name}/{obj_name}_{ret_type}_{save_name}.pt"
+        if os.path.exists(data_fname_dexycb):
+            data_fname = data_fname_dexycb
+        else:
+            raise FileNotFoundError(
+                f"Retarget file not found. Tried: {data_fname} and {data_fname_dexycb}"
+            )
 
     if data_fname.endswith(".npy"):
         data = np.load(data_fname, allow_pickle=True).item()
@@ -210,7 +218,15 @@ def load_contact_retarget_data(
     # e.g. assets/contact_retarget/ability_hand/s01/box_use_01.npy
     fname = f"{RETARGET_CONTACT_DIR}/{hand_name}/{subject_name}/{obj_name}_use_{use_clip}.npy"
     fname = str(fname)
-    assert os.path.exists(fname), f"File {fname} not found"
+    if not os.path.exists(fname):
+        # DexYCB: map_contacts saves as {sequence_id}.npy (same as input .npy, no _use_01)
+        fname_dexycb = f"{RETARGET_CONTACT_DIR}/{hand_name}/{subject_name}/{obj_name}.npy"
+        if os.path.exists(fname_dexycb):
+            fname = fname_dexycb
+        else:
+            raise FileNotFoundError(
+                f"Contact retarget file not found. Tried: {fname} and {fname_dexycb}"
+            )
     loaded = np.load(fname, allow_pickle=True).item()
 
     if hand_sides is None:

@@ -18,6 +18,27 @@ from dexmachina.retargeting.contact_utils import (
 from dexmachina.retargeting.coordinate_utils import dexycb_world_to_genesis
 from dexmachina.asset_utils import get_asset_path
 
+
+# DexYCB/manopth MANO joint order differs from the internal order used across this repo
+# (see MANO_HAND_LINKS and retarget configs where fingertip indices are 16..20).
+# We remap joints here so downstream retargeting/contact code can use one consistent convention.
+# dst_idx -> src_idx mapping (both length 21):
+# internal: [wrist, idx(1..3), mid(1..3), pinky(1..3), ring(1..3), thumb(1..3), tips(thumb,idx,mid,ring,pinky)]
+# manopth: [wrist, idx(1..4), mid(1..4), pinky(1..4), ring(1..4), thumb(1..4)]
+_MANOPTH_TO_INTERNAL_JOINT_ORDER = np.array(
+    [0, 1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15, 17, 18, 19, 20, 4, 8, 16, 12],
+    dtype=np.int64,
+)
+
+
+def _reorder_mano_joints_to_internal(joints):
+    """Reorder MANO joints from manopth output convention to DexMachina internal convention."""
+    joints = np.asarray(joints)
+    if joints.shape[0] != 21:
+        raise ValueError(f"Expected 21 MANO joints, got shape {joints.shape}")
+    return joints[_MANOPTH_TO_INTERNAL_JOINT_ORDER]
+
+
 def _verify_processed_npy(args):
     """Load a processed DexYCB .npy and run sanity checks."""
     save_dir = args.save_dir
@@ -367,6 +388,7 @@ def main():
         joints = joints.squeeze(0).cpu().numpy() / 1000.0
         verts_world = _transform_pts_cam_to_world(verts, R_c, t_c)
         joints_world = _transform_pts_cam_to_world(joints, R_c, t_c)
+        joints_world = _reorder_mano_joints_to_internal(joints_world)
 
         if mano_side == "left":
             joints_left[out_idx] = joints_world
@@ -424,7 +446,7 @@ def main():
     shape_l[:] = mano_betas if mano_side == "left" else 0.0
     shape_r[:] = mano_betas if mano_side == "right" else 0.0
 
-    # Transform DexYCB world -> Genesis frame (AprilTag frame + offset to place object bottom on table)
+    # Transform DexYCB world -> Genesis frame (AprilTag frame + offset to place the spawn frame on the table)
     obj_half_height = _bbox_center_to_bottom(obj_verts_model)
     T_apriltag = np.array(T["apriltag"], dtype=np.float32).reshape(3, 4)
     R_tag, t_tag = T_apriltag[:, :3], T_apriltag[:, 3]
@@ -440,6 +462,7 @@ def main():
         R_tag,
         t_tag,
         obj_half_height=obj_half_height,
+        obj_verts_model=obj_verts_model,
     )
     obj_rot = np.stack([_rotation_matrix_to_axis_angle(R.from_quat([q[1], q[2], q[3], q[0]]).as_matrix()) for q in obj_quat], axis=0)
 

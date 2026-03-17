@@ -99,7 +99,9 @@ class Curriculum:
         assert self.fixed_mode in ['lin', 'exp', 'uniform'], "Invalid fixed mode"
         
         self.uniform_mode = curr_cfg['uniform_mode']
-        self.obj_ndof = 7 # base + articulation
+        # Use object's actual DOF count so gain tensors match (e.g. 1 for YCB, 7 for free-floating base + joint).
+        dof_idxs = getattr(task_object, "_voc_dof_idxs", None) or getattr(task_object, "dof_idxs", None)
+        self.obj_ndof = len(dof_idxs) if dof_idxs is not None else 7
         assert self.uniform_mode in ['fast', 'slow'], "Invalid uniform mode"
         self.deque_appends = 0
         self.deque_append_freq = curr_cfg['deque_freq'] 

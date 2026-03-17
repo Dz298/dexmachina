@@ -58,8 +58,51 @@ def _get_ycb_1dof_urdf_path(mesh_dir):
     return urdf_path
 
 
-def get_ycb_object_cfg(ycb_class_name, dex_ycb_dir=None):
-    """Config for YCB object (DexYCB) as ArticulatedObject with 1 dummy DOF for virtual controller."""
+def _get_ycb_7dof_urdf_path(mesh_dir):
+    """Ensure a 7-DOF URDF exists: 6 DOF free-floating base (position + rotation) + 1 dummy revolute (0-0)."""
+    urdf_path = join(mesh_dir, "object_7dof.urdf")
+    if not os.path.exists(urdf_path):
+        urdf_content = '''<?xml version="1.0"?>
+<robot name="ycb_object_7dof">
+  <link name="world"/>
+  <link name="base"/>
+  <link name="object">
+    <visual>
+      <geometry>
+        <mesh filename="textured_simple.obj" scale="1 1 1"/>
+      </geometry>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="textured_simple.obj" scale="1 1 1"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="0.1"/>
+      <inertia ixx="0.001" ixy="0" ixz="0" iyy="0.001" iyz="0" izz="0.001"/>
+    </inertial>
+  </link>
+  <joint name="free_joint" type="floating">
+    <parent link="world"/>
+    <child link="base"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+  <joint name="dummy_joint" type="revolute">
+    <parent link="base"/>
+    <child link="object"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="0" upper="0" effort="0" velocity="0"/>
+  </joint>
+</robot>
+'''
+        with open(urdf_path, "w") as f:
+            f.write(urdf_content)
+    return urdf_path
+
+
+def get_ycb_object_cfg(ycb_class_name, dex_ycb_dir=None, voc_7dof=True):
+    """Config for YCB object (DexYCB). voc_7dof=True (default): 7 DOF (6 pose + 1 dummy joint) for training/VOC."""
     if dex_ycb_dir is None:
         dex_ycb_dir = os.environ.get("DEX_YCB_DIR")
     if dex_ycb_dir and os.path.isdir(dex_ycb_dir):
@@ -68,7 +111,9 @@ def get_ycb_object_cfg(ycb_class_name, dex_ycb_dir=None):
         mesh_dir = str(get_asset_path(f"dex_ycb/models/{ycb_class_name}"))
     mesh_fname = join(mesh_dir, "textured_simple.obj")
     assert os.path.exists(mesh_fname), f"YCB mesh not found: {mesh_fname}"
-    urdf_path = _get_ycb_1dof_urdf_path(mesh_dir)
+    urdf_path = _get_ycb_7dof_urdf_path(mesh_dir) if voc_7dof else _get_ycb_1dof_urdf_path(mesh_dir)
+    # 7-DOF URDF has explicit floating joint; root (world) must be fixed so we get 6+1=7 DOF (not 6+6+1).
+    fixed = True if voc_7dof else False
     return {
         "name": ycb_class_name,
         "object_type": "ycb",
@@ -78,7 +123,7 @@ def get_ycb_object_cfg(ycb_class_name, dex_ycb_dir=None):
         "base_init_quat": [1.0, 0.0, 0.0, 0.0],
         "base_init_qpos": [0.0],
         "convexify": True,
-        "fixed": False,
+        "fixed": fixed,
         "actuated": False,
         "offset_pos": [0.0, 0.0, 0.0],
         "color": None,
@@ -163,6 +208,7 @@ class ArticulatedObject:
         self.num_joints = 1 
         self.dof_idxs = None
         self.obs_scale = obs_scale
+        self.has_revolute_joint = True
  
         base_pos = obj_cfg["base_init_pos"]
         base_quat = obj_cfg["base_init_quat"]
@@ -190,12 +236,20 @@ class ArticulatedObject:
         self.num_envs = num_envs
         self.scene = scene 
         
+        spawn_pos = self.init_pos.cpu().numpy()
+        spawn_quat = self.init_quat.cpu().numpy()
+        # YCB VOC (7-DOF) already encodes absolute root pose in floating-joint targets.
+        # Spawn at origin to avoid adding init pose twice (URDF base pose + floating translation).
+        if obj_cfg.get("object_type") == "ycb" and obj_cfg.get("fixed", False):
+            spawn_pos = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+            spawn_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+
         entity = scene.add_entity(
             gs.morphs.URDF(
                 fixed=self.cfg.get("fixed", False),
                 file=self.cfg["urdf_path"],
-                pos=self.init_pos.cpu().numpy(),
-                quat=self.init_quat.cpu().numpy(),
+                pos=spawn_pos,
+                quat=spawn_quat,
                 convexify=self.cfg.get("convexify", True),
                 recompute_inertia=False,
                 collision=(not disable_collision), 
@@ -207,6 +261,7 @@ class ArticulatedObject:
         )
         movable_joints = [joint for joint in entity.joints if joint.type in [gs.JOINT_TYPE.REVOLUTE, gs.JOINT_TYPE.PRISMATIC]]
         is_ycb = obj_cfg.get("object_type") == "ycb"
+        self.is_ycb = is_ycb
         if is_ycb:
             # YCB: fixed base (retarget) -> 1 DOF; free base (training) -> 7 DOFs for VOC (position, rotation, virtual joint).
             if entity.n_dofs == 1:
@@ -217,12 +272,15 @@ class ArticulatedObject:
                 self.dof_idxs = [6]  # only the revolute for state_diff / dof_pos
                 self._voc_dof_idxs = list(range(7))
             self.num_joints = 1
+            # DexYCB objects are rigid in semantics; the revolute DOF is a virtual/dummy control slot.
+            self.has_revolute_joint = False
         else:
             assert len(movable_joints) == 1, f"len(movable_joints)={len(movable_joints)}"
             assert all([isinstance(joint.dof_idx_local, int) for joint in movable_joints]), "Only one dof per joint is supported"
             self.dof_idxs = [joint.dof_idx_local for joint in movable_joints]
             self._voc_dof_idxs = None  # use dof_idxs for VOC
             self.num_joints = 1
+            self.has_revolute_joint = True
 
         self.texture_meshes = dict()
         self._part_surface_meshes = None
@@ -245,7 +303,8 @@ class ArticulatedObject:
                 self.texture_meshes[part] = mesh
         self.link_frames = dict()
         if obj_cfg.get("show_link_frame", False):
-            for part in ["top", "bottom"]: 
+            frame_parts = ["object"] if is_ycb else ["top", "bottom"]
+            for part in frame_parts:
                 for axis, color in zip(["x", "y", "z"], [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]):
                     mesh = scene.add_entity(
                         morph=gs.morphs.Mesh(
@@ -259,13 +318,15 @@ class ArticulatedObject:
                     self.link_frames[f"{part}_{axis}"] = mesh
 
                 
-        
+        self.entity = entity
         self.n_links = len(entity.links)
         self.link_names = [link.name for link in entity.links] # this is ordered 'bottom', 'top'!!
+        self.link_name_to_local_idx = {name: i for i, name in enumerate(self.link_names)}
+        self.surface_link_names = self._infer_surface_link_names()
+        self.surface_link_idxs = [self.link_name_to_local_idx[name] for name in self.surface_link_names]
         self.coll_idxs_global = [link.idx for link in entity.links if len(link.geoms) > 0]
 
         self.actuated = self.cfg.get("actuated", False)
-        self.entity = entity
         self.initialize_value_buffers()
         self.initialized = True
         self.obs_dim, self.obs_dims = self.compute_obs_dim()
@@ -276,24 +337,77 @@ class ArticulatedObject:
             print("Collecting data from object")
         self.episode_data = defaultdict(list)
         self.post_built = False
+
+    def _infer_surface_link_names(self):
+        """Surface-part names used for mesh sampling/contact/tip-distance observations."""
+        if self.is_ycb:
+            if "object" in self.link_name_to_local_idx:
+                return ["object"]
+            # Fallback: use collision-bearing links if custom URDF differs.
+            return [link.name for link in self.entity.links if len(link.geoms) > 0]
+
+        preferred = [name for name in ("top", "bottom") if name in self.link_name_to_local_idx]
+        if len(preferred) > 0:
+            return preferred
+        return [link.name for link in self.entity.links if len(link.geoms) > 0]
+
+    def get_surface_part_names(self):
+        return list(self.surface_link_names)
     
     def post_scene_build_setup(self):
         obj_cfg = self.cfg  
         if self.actuated:
             # set kp kv!
             self.set_joint_gains(self.kp, self.kv, self.force_range)
-            demo_dofs = [] # use this to control actuated obj
-            for i in range(self.demo_states.shape[0]):
-                _state = self.demo_states[i] 
-                self.set_object_state(
-                    root_pos=_state[:3][None].repeat(self.num_envs, 1),
-                    root_quat=_state[3:7][None].repeat(self.num_envs, 1),
-                    joint_qpos=_state[7:8][None].repeat(self.num_envs, 1),
+            if getattr(self, "_voc_dof_idxs", None) is not None:
+                # YCB 7-DOF path: drive floating-base dofs directly from demo root pose.
+                self.demo_dofs = self._compose_voc_targets(
+                    self.demo_states[:, :3],
+                    self.demo_states[:, 3:7],
+                    self.demo_states[:, 7:8],
                 )
-                dofs_pos = self.entity.get_dofs_position()
-                demo_dofs.append(dofs_pos[0])
-            self.demo_dofs = torch.stack(demo_dofs, dim=0)
+            else:
+                demo_dofs = [] # use this to control actuated obj
+                for i in range(self.demo_states.shape[0]):
+                    _state = self.demo_states[i]
+                    self.set_object_state(
+                        root_pos=_state[:3][None].repeat(self.num_envs, 1),
+                        root_quat=_state[3:7][None].repeat(self.num_envs, 1),
+                        joint_qpos=_state[7:8][None].repeat(self.num_envs, 1),
+                    )
+                    dofs_pos = self.entity.get_dofs_position()
+                    demo_dofs.append(dofs_pos[0])
+                self.demo_dofs = torch.stack(demo_dofs, dim=0)
         self.post_built = True
+
+    def _quat_wxyz_to_rotvec(self, quat):
+        """Convert quaternion (w,x,y,z) to rotation vector (rx, ry, rz)."""
+        q = torch.as_tensor(quat, dtype=torch.float32, device=self.device)
+        q = q / torch.clamp(torch.linalg.norm(q, dim=-1, keepdim=True), min=1e-8)
+        w = torch.clamp(q[..., 0], -1.0, 1.0)
+        xyz = q[..., 1:4]
+        sin_half = torch.linalg.norm(xyz, dim=-1, keepdim=True)
+        angle = 2.0 * torch.atan2(sin_half, w[..., None])
+        axis = xyz / torch.clamp(sin_half, min=1e-8)
+        rotvec = axis * angle
+        small = sin_half < 1e-6
+        # For tiny angles: sin(theta/2) ~= theta/2  ->  rotvec ~= 2*xyz
+        rotvec = torch.where(small.expand_as(rotvec), 2.0 * xyz, rotvec)
+        return rotvec
+
+    def _compose_voc_targets(self, root_pos, root_quat, joint_qpos):
+        """Compose YCB VOC control targets: [tx, ty, tz, rx, ry, rz, dummy_joint]."""
+        root_pos = torch.as_tensor(root_pos, dtype=torch.float32, device=self.device)
+        root_quat = torch.as_tensor(root_quat, dtype=torch.float32, device=self.device)
+        joint_qpos = torch.as_tensor(joint_qpos, dtype=torch.float32, device=self.device)
+        if root_pos.ndim == 1:
+            root_pos = root_pos[None]
+        if root_quat.ndim == 1:
+            root_quat = root_quat[None]
+        if joint_qpos.ndim == 1:
+            joint_qpos = joint_qpos[:, None]
+        rotvec = self._quat_wxyz_to_rotvec(root_quat)
+        return torch.cat([root_pos, rotvec, joint_qpos], dim=-1)
 
     def set_demo_states(self, demo_data):
         obj_pos = demo_data["obj_pos"]
@@ -394,15 +508,19 @@ class ArticulatedObject:
         
     def sample_mesh_vertices(self, num_samples: int, part="top", seed=42) -> torch.Tensor:
         import trimesh
-        mesh_fname = self.cfg[f"{part}_mesh_fname"]
+        # YCB/single-mesh objects use "mesh_fname"; ARCTIC uses "top_mesh_fname", "bottom_mesh_fname"
+        mesh_fname = self.cfg.get(f"{part}_mesh_fname") or self.cfg.get("mesh_fname")
+        assert mesh_fname is not None, f"No mesh_fname or {part}_mesh_fname in object config"
         mesh = trimesh.load(mesh_fname)
-        vertices = mesh.vertices
+        if isinstance(mesh, trimesh.Scene):
+            vertices = np.concatenate([m.vertices for m in mesh.geometry.values()], axis=0)
+        else:
+            vertices = mesh.vertices
         num_vertices = vertices.shape[0]
-        replace = num_samples > num_vertices 
-        # make this deterministic
+        replace = num_samples > num_vertices
         np.random.seed(seed)
         idxs = np.random.choice(num_vertices, num_samples, replace=replace)
-        return torch.tensor(vertices[idxs], dtype=torch.float32)
+        return torch.tensor(vertices[idxs].astype(np.float32), device=self.device)
 
     def _load_part_surface_meshes(self):
         if self._part_surface_meshes is not None:
@@ -455,13 +573,20 @@ class ArticulatedObject:
         assert self.initialized, "Object not initialized"
         entity = self.entity
         assert self.dof_idxs is not None, "dof_idxs is None"
-        self.root_pos[:] = entity.get_pos()
-        self.root_quat[:] = entity.get_quat()
-        self.root_ang_vel[:] = entity.get_ang()
-        self.root_lin_vel[:] = entity.get_vel()
-
-        self.part_pos[:] = entity.get_links_pos() # this contains both parts!
+        self.part_pos[:] = entity.get_links_pos()
         self.part_quat[:] = entity.get_links_quat()
+        # 7-DOF YCB: root is "world" (fixed); use "base" link (idx 1) for moving pose.
+        if getattr(self, "_voc_dof_idxs", None) is not None:
+            base_idx = self.link_name_to_local_idx.get("base", 1)
+            self.root_pos[:] = self.part_pos[:, base_idx]
+            self.root_quat[:] = self.part_quat[:, base_idx]
+            self.root_ang_vel[:] = entity.get_ang()
+            self.root_lin_vel[:] = entity.get_vel()
+        else:
+            self.root_pos[:] = entity.get_pos()
+            self.root_quat[:] = entity.get_quat()
+            self.root_ang_vel[:] = entity.get_ang()
+            self.root_lin_vel[:] = entity.get_vel()
 
         self.dof_pos[:] = entity.get_dofs_position(self.dof_idxs)
         self.dof_vel[:] = entity.get_dofs_velocity(self.dof_idxs)
@@ -495,6 +620,9 @@ class ArticulatedObject:
         return obs_dict  
 
     def get_part_pose(self, part='top'):
+        if part not in self.link_name_to_local_idx and self.is_ycb:
+            # Keep legacy callers robust for rigid YCB objects.
+            part = self.surface_link_names[0]
         idx = self.link_names.index(part)
         pose = torch.cat([self.part_pos[:, idx], self.part_quat[:, idx]], dim=-1)
         return pose
@@ -527,7 +655,7 @@ class ArticulatedObject:
             env_idxs = np.arange(self.num_envs)
         
         if self.actuated and reset_gains:
-            dof_idxs = [i for i in range(7)]
+            dof_idxs = getattr(self, "_voc_dof_idxs", None) or self.dof_idxs
             num_dofs = len(dof_idxs) 
             rand_scale = torch.rand((len(env_idxs), 1)) * 0.3 + 0.7 # range [0.5, 1.0]
             kp = torch.ones(len(env_idxs), num_dofs) * self.kp * rand_scale
@@ -540,29 +668,43 @@ class ArticulatedObject:
 
         self.dof_pos[env_idxs, :] = init_qpos
         self.dof_vel[env_idxs, :] = 0.0
-        self.entity.set_dofs_position(
-            position=self.dof_pos[env_idxs],
-            dofs_idx_local=self.dof_idxs,
-            zero_velocity=True,
-            envs_idx=env_idxs,
-        )
         init_pos = self.init_pos
         if episode_start is not None and torch.any(episode_start):
             init_pos = self.demo_states[episode_start, :3].clone()
         self.root_pos[env_idxs, :] = init_pos
-        self.entity.set_pos(
-            pos=self.root_pos[env_idxs],
-            envs_idx=env_idxs,
-        )
 
         init_quat = self.init_quat
         if episode_start is not None and torch.any(episode_start):
             init_quat = self.demo_states[episode_start, 3:7].clone()
         self.root_quat[env_idxs, :] = init_quat
-        self.entity.set_quat(
-            quat=self.root_quat[env_idxs],
-            envs_idx=env_idxs,
-        )
+
+        if getattr(self, "_voc_dof_idxs", None) is not None:
+            voc_targets = self._compose_voc_targets(
+                self.root_pos[env_idxs],
+                self.root_quat[env_idxs],
+                self.dof_pos[env_idxs],
+            )
+            self.entity.set_dofs_position(
+                position=voc_targets,
+                dofs_idx_local=self._voc_dof_idxs,
+                zero_velocity=True,
+                envs_idx=env_idxs,
+            )
+        else:
+            self.entity.set_dofs_position(
+                position=self.dof_pos[env_idxs],
+                dofs_idx_local=self.dof_idxs,
+                zero_velocity=True,
+                envs_idx=env_idxs,
+            )
+            self.entity.set_pos(
+                pos=self.root_pos[env_idxs],
+                envs_idx=env_idxs,
+            )
+            self.entity.set_quat(
+                quat=self.root_quat[env_idxs],
+                envs_idx=env_idxs,
+            )
 
         self.root_ang_vel[env_idxs, :] = 0.0
         self.root_lin_vel[env_idxs, :] = 0.0
@@ -584,28 +726,36 @@ class ArticulatedObject:
         assert self.initialized, "Object not initialized"
         if root_pos.shape == (3,):
             root_pos = root_pos[None]
-        
-        self.entity.set_pos(
-            pos=root_pos,
-            envs_idx=env_idxs,
-        )
 
         if root_quat.shape == (4,):
             root_quat = root_quat[None]
-        self.entity.set_quat(
-            quat=root_quat, 
-            envs_idx=env_idxs,
-        )
 
         if len(joint_qpos.shape) == 1:
             joint_qpos = joint_qpos[None]
         assert joint_qpos.shape[-1] == self.num_joints, f"joint_qpos.shape={joint_qpos.shape}"
-        self.entity.set_dofs_position(
-            position=joint_qpos,
-            dofs_idx_local=self.dof_idxs,
-            zero_velocity=True,
-            envs_idx=env_idxs,
-        ) 
+        if getattr(self, "_voc_dof_idxs", None) is not None:
+            voc_targets = self._compose_voc_targets(root_pos, root_quat, joint_qpos)
+            self.entity.set_dofs_position(
+                position=voc_targets,
+                dofs_idx_local=self._voc_dof_idxs,
+                zero_velocity=True,
+                envs_idx=env_idxs,
+            )
+        else:
+            self.entity.set_pos(
+                pos=root_pos,
+                envs_idx=env_idxs,
+            )
+            self.entity.set_quat(
+                quat=root_quat,
+                envs_idx=env_idxs,
+            )
+            self.entity.set_dofs_position(
+                position=joint_qpos,
+                dofs_idx_local=self.dof_idxs,
+                zero_velocity=True,
+                envs_idx=env_idxs,
+            )
         self.entity.zero_all_dofs_velocity(envs_idx=env_idxs)
         self.update_value_buffers()  
     
@@ -624,13 +774,11 @@ class ArticulatedObject:
                 mesh.set_quat(pose[:, 3:7])
         if len(self.link_frames) > 0:
             # visualize the root frame on axis meshes:
-             for part in ["top"]:
-            # for part in ["top", "bottom"]:
-                for axis in ["x", "y", "z"]:
-                    mesh = self.link_frames[f"{part}_{axis}"]
-                    pose = self.get_part_pose(part)
-                    mesh.set_pos(pose[:, :3])
-                    mesh.set_quat(pose[:, 3:7]) 
+            for key, mesh in self.link_frames.items():
+                part, _axis = key.rsplit("_", 1)
+                pose = self.get_part_pose(part)
+                mesh.set_pos(pose[:, :3])
+                mesh.set_quat(pose[:, 3:7])
 
         self.episode_length_buf += 1
         return 
@@ -671,175 +819,15 @@ class ArticulatedObject:
     
     def get_object_vertices(self, num_verts=300):
         """ return:
-        - current object's transformed vertices: (num_envs, num_verts * 2_parts, 3) 
-        - part ids: (num_envs, num_verts * 2_parts)
+        - current object's transformed vertices: (num_envs, num_verts * num_parts, 3)
+        - part ids: (num_verts * num_parts,)
         """
-        top_verts = self.get_part_vertices("top", num_verts)
-        bottom_verts = self.get_part_vertices("bottom", num_verts) 
-        verts = torch.cat([top_verts, bottom_verts], dim=1)
-        ids = torch.cat([torch.zeros(num_verts), torch.ones(num_verts)]).long()
+        parts = self.get_surface_part_names()
+        verts_list = []
+        ids_list = []
+        for part_id, part in enumerate(parts):
+            verts_list.append(self.get_part_vertices(part, num_verts))
+            ids_list.append(torch.full((num_verts,), part_id, dtype=torch.long, device=self.device))
+        verts = torch.cat(verts_list, dim=1)
+        ids = torch.cat(ids_list, dim=0)
         return verts, ids
-
-
-class RigidObject:
-    """Rigid mesh object (e.g. YCB). No joints. Compatible with base_env object interface."""
-
-    def __init__(
-        self,
-        obj_cfg,
-        device,
-        scene,
-        num_envs,
-        demo_data=None,
-        disable_collision=False,
-    ):
-        self.name = obj_cfg["name"]
-        self.cfg = obj_cfg
-        self.device = device
-        self.num_envs = num_envs
-        self.scene = scene
-        self.actuated = False
-        self.num_joints = 1
-        self.dof_idxs = []
-        self.n_links = 1
-        self.link_names = ["base"]
-        self.link_frames = dict()
-        self.texture_meshes = dict()
-        self.initialized = False
-
-        base_pos = obj_cfg["base_init_pos"]
-        base_quat = obj_cfg["base_init_quat"]
-        self.offset_pos = obj_cfg.get("offset_pos", [0.0, 0.0, 0.0])
-        base_pos = [base_pos[i] + self.offset_pos[i] for i in range(3)]
-        self.demo_states = None
-        self.num_demo_frames = 0
-        if demo_data is not None and demo_data != {}:
-            base_pos, base_quat = self._set_demo_states(demo_data)
-            self.num_demo_frames = self.demo_states.shape[0]
-
-        self.init_pos = torch.tensor(base_pos, dtype=torch.float32, device=self.device)
-        self.init_quat = torch.tensor(base_quat, dtype=torch.float32, device=self.device)
-        self.init_qpos = torch.tensor([0.0], dtype=torch.float32, device=self.device)
-
-        entity = scene.add_entity(
-            gs.morphs.Mesh(
-                file=obj_cfg["mesh_fname"],
-                pos=self.init_pos.cpu().numpy(),
-                quat=self.init_quat.cpu().numpy(),
-                fixed=obj_cfg.get("fixed", False),
-                collision=(not disable_collision),
-                convexify=obj_cfg.get("convexify", True),
-                scale=1.0,
-            ),
-            surface=gs.surfaces.Smooth(color=obj_cfg.get("color"))
-            if obj_cfg.get("color") is not None
-            else None,
-        )
-        self.entity = entity
-        self.coll_idxs_global = [link.idx for link in entity.links if len(link.geoms) > 0]
-        if not self.coll_idxs_global and hasattr(entity, "links") and len(entity.links) > 0:
-            self.coll_idxs_global = [0]
-
-        self.initialize_value_buffers()
-        self.episode_length_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.int32)
-        self.episode_data = defaultdict(list)
-        self.initialized = True
-        self.obs_dim, self.obs_dims = self.compute_obs_dim()
-
-    def _set_demo_states(self, demo_data):
-        obj_pos = demo_data["obj_pos"]
-        obj_quat = demo_data["obj_quat"]
-        obj_arti = demo_data.get("obj_arti", np.zeros(len(obj_pos)))
-        if len(obj_arti.shape) == 1:
-            obj_arti = obj_arti[:, None]
-        obj_pos = obj_pos + np.array(self.offset_pos)[None]
-        base_pos, base_quat = obj_pos[0], obj_quat[0]
-        self.demo_states = np.concatenate([obj_pos, obj_quat, obj_arti], axis=1)
-        self.demo_states = torch.tensor(
-            self.demo_states, dtype=torch.float32, device=self.device
-        )
-        return base_pos, base_quat
-
-    def set_to_demo_step(self, step=0):
-        assert self.demo_states is not None
-        demo_state = self.demo_states[step]
-        self.set_object_state(
-            root_pos=demo_state[:3][None].repeat(self.num_envs, 1),
-            root_quat=demo_state[3:7][None].repeat(self.num_envs, 1),
-            joint_qpos=demo_state[7:8][None].repeat(self.num_envs, 1),
-        )
-
-    def sample_mesh_vertices(self, num_samples=300, part="base", seed=42):
-        import trimesh
-
-        mesh_fname = self.cfg["mesh_fname"]
-        mesh = trimesh.load(mesh_fname)
-        if isinstance(mesh, trimesh.Scene):
-            vertices = np.concatenate([m.vertices for m in mesh.geometry.values()], axis=0)
-        else:
-            vertices = mesh.vertices
-        np.random.seed(seed)
-        idxs = np.random.choice(
-            len(vertices),
-            min(num_samples, len(vertices)),
-            replace=num_samples > len(vertices),
-        )
-        return torch.tensor(vertices[idxs].astype(np.float32), device=self.device)
-
-    def get_part_pose(self, part="base"):
-        return torch.cat([self.root_pos, self.root_quat], dim=-1)
-
-    def set_object_state(self, root_pos, root_quat, joint_qpos, env_idxs=None):
-        if env_idxs is None:
-            env_idxs = list(range(self.num_envs))
-        if root_pos.shape == (3,):
-            root_pos = root_pos[None]
-        if root_quat.shape == (4,):
-            root_quat = root_quat[None]
-        self.entity.set_pos(root_pos, envs_idx=env_idxs)
-        self.entity.set_quat(root_quat, envs_idx=env_idxs)
-
-    def transform_part_vertices(self, mesh_verts, part="base"):
-        pose = self.get_part_pose(part)
-        quat = pose[:, 3:7]
-        matrices = matrix_from_quat(quat)
-        offsets = pose[:, :3].unsqueeze(1)
-        mesh_verts = mesh_verts.to(self.device)
-        if mesh_verts.dim() == 2:
-            mesh_verts = mesh_verts[None]
-        transformed = torch.einsum("nij,nkj->nki", matrices, mesh_verts) + offsets
-        return transformed
-
-    def initialize_value_buffers(self):
-        self.root_pos = torch.zeros((self.num_envs, 3), dtype=torch.float32, device=self.device)
-        self.root_quat = torch.zeros((self.num_envs, 4), dtype=torch.float32, device=self.device)
-        self.root_ang_vel = torch.zeros((self.num_envs, 3), dtype=torch.float32, device=self.device)
-        self.root_lin_vel = torch.zeros((self.num_envs, 3), dtype=torch.float32, device=self.device)
-        self.part_pos = torch.zeros((self.num_envs, 1, 3), dtype=torch.float32, device=self.device)
-        self.part_quat = torch.zeros((self.num_envs, 1, 4), dtype=torch.float32, device=self.device)
-        self.dof_pos = torch.zeros((self.num_envs, 1), dtype=torch.float32, device=self.device)
-        self.dof_vel = torch.zeros((self.num_envs, 1), dtype=torch.float32, device=self.device)
-        self.contact_force = torch.zeros((self.num_envs, 1, 3), dtype=torch.float32, device=self.device)
-        self.state_diff = torch.zeros((self.num_envs, 8), dtype=torch.float32, device=self.device)
-
-    def update_value_buffers(self):
-        self.root_pos[:] = self.entity.get_pos()
-        self.root_quat[:] = self.entity.get_quat()
-        self.root_ang_vel[:] = self.entity.get_ang()
-        self.root_lin_vel[:] = self.entity.get_vel()
-        self.part_pos[:, 0] = self.root_pos
-        self.part_quat[:, 0] = self.root_quat
-        if self.demo_states is not None:
-            demo_goal_t = torch.clamp(
-                self.episode_length_buf + 1, 0, self.num_demo_frames - 1
-            )
-            self.state_diff[:] = (
-                self.demo_states[demo_goal_t]
-                - torch.cat([self.root_pos, self.root_quat, self.dof_pos], dim=-1)
-            )
-
-    def compute_obs_dim(self):
-        return 8, {"root_pos": 3, "root_quat": 4, "dof_pos": 1}
-
-    def post_scene_build_setup(self):
-        pass

@@ -28,13 +28,14 @@ def dexycb_world_to_genesis(
     t_tag,
     table_center=None,
     obj_half_height=0.0,
+    obj_verts_model=None,
 ):
     """Transform DexYCB world frame data to Genesis frame. Modifies arrays in place.
 
     World -> Tag: p_tag = R_w2t @ p_world + t_w2t. AprilTag frame has Z-up (Genesis convention).
-    Offset positions so object bottom (lowest point) sits on table top. obj_half_height is the
-    vertical distance from object center to bottom in model frame (e.g. from mesh bbox);
-    when > 0, target center Z = table_center[2] + obj_half_height.
+    Offset positions so the spawn frame's object bottom sits on the table top. When
+    obj_verts_model is provided, compute the support height from the object's actual Genesis-frame
+    orientation at the first valid frame; otherwise fall back to obj_half_height.
     """
     if table_center is None:
         table_center = TABLE_TOP_CENTER
@@ -45,14 +46,30 @@ def dexycb_world_to_genesis(
     R_w2t = np.linalg.inv(R_tag).astype(np.float32)
     t_w2t = (-R_w2t @ t_tag).astype(np.float32)
 
-    target_center = table_center.copy()
-    target_center[2] = table_center[2] + obj_half_height
-
     valid = np.any(obj_trans != 0, axis=1)
+    valid_indices = np.flatnonzero(valid)
+
+    support_height = obj_half_height
+    support_bottom_z = None
+    if valid_indices.size > 0 and obj_verts_model is not None:
+        first_valid = int(valid_indices[0])
+        qw, qx, qy, qz = obj_quat[first_valid, 0], obj_quat[first_valid, 1], obj_quat[first_valid, 2], obj_quat[first_valid, 3]
+        R_obj = R.from_quat([qx, qy, qz, qw]).as_matrix()
+        R_obj_genesis = R_w2t @ R_obj
+        verts_genesis = np.asarray(obj_verts_model, dtype=np.float64) @ R_obj_genesis.T
+        support_height = float(-np.min(verts_genesis[:, 2]))
+        first_center_tag = (obj_trans[first_valid] @ R_w2t.T) + t_w2t
+        support_bottom_z = float(first_center_tag[2] + np.min(verts_genesis[:, 2]))
+
+    target_center = table_center.copy()
+    target_center[2] = table_center[2] + support_height
+
     if np.any(valid):
         pt_tag = (obj_trans[valid] @ R_w2t.T) + t_w2t
         median_tag = np.median(pt_tag, axis=0)
         offset = target_center - median_tag
+        if support_bottom_z is not None:
+            offset[2] = table_center[2] - support_bottom_z
     else:
         offset = target_center.copy()
 

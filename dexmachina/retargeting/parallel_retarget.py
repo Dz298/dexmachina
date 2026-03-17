@@ -194,7 +194,7 @@ def prepare_cfgs(
     if data_source == "dexycb":
         loaded = np.load(input_fname, allow_pickle=True).item()
         ycb_class = loaded.get("params", {}).get("ycb_class_name", "002_master_chef_can")
-        obj_cfg = get_ycb_object_cfg(str(ycb_class))
+        obj_cfg = get_ycb_object_cfg(str(ycb_class), voc_7dof=False)  # fixed base for retargeting
         # Trimmed .npy may have fewer frames than clip range; use actual length
         actual_len = demo_data["obj_pos"].shape[0]
         num_envs = min(end - start, actual_len)
