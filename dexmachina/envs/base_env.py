@@ -10,6 +10,11 @@ from dexmachina.envs.contacts import get_filtered_contacts
 from dexmachina.envs.randomizations import RandomizationModule
 from dexmachina.envs.curriculum import Curriculum 
 from dexmachina.envs.maniptrans_curr import ManipTransCurriculum 
+from dexmachina.envs.virtual_force import (
+    compute_virtual_force,
+    normals_local_to_world_torch,
+    points_local_to_world_torch,
+)
 from typing import Dict, List, Tuple, Union
 from collections import deque
 from genesis.engine.solvers.rigid.rigid_solver_decomp import RigidSolver
@@ -185,6 +190,9 @@ class BaseEnv:
         self.demo_data = demo_data
         self.curr_cfg = curriculum_cfg
         self.group_collisions = group_collisions
+        self.virtual_force_cfg = env_cfg.get('virtual_force_cfg', dict())
+        self.use_virtual_force_assist = env_cfg.get('use_virtual_force_assist', False)
+        self.virtual_force_meta = dict()
 
         # Grasp optimization controls must be defined before post_scene_build_setup
         self.rand_init_ratio = env_cfg.get('rand_init_ratio', 0.0)
@@ -301,6 +309,7 @@ class BaseEnv:
         self.obj_verts = dict()
         self._setup_contact_link_metadata()
         self.n_objects = len(self.object_names) # might be 0!!
+        self._setup_virtual_force_metadata()
        
         self.use_curriculum = False 
         self.curriculum = None
@@ -418,6 +427,122 @@ class BaseEnv:
                 link_local_idxs=torch.tensor(link_idxs, dtype=torch.long, device=self.device),
                 num_links=len(link_idxs),
             )
+
+    def _setup_virtual_force_metadata(self):
+        self.virtual_force_meta = dict()
+        if not self.use_virtual_force_assist:
+            return
+        if self.n_objects != 1 or self.object is None:
+            print("[virtual-force] Disabling assist: requires exactly one object")
+            self.use_virtual_force_assist = False
+            return
+
+        keywords = [kw.lower() for kw in self.virtual_force_cfg.get('link_keywords', [])]
+        required_per_side = (
+            "contact_links_local_{side}",
+            "contact_normals_local_{side}",
+            "contact_links_valid_{side}",
+        )
+        for side, meta in self.contact_link_meta.items():
+            if any(template.format(side=side) not in self.demo_data for template in required_per_side):
+                continue
+            robot = self.robots.get(side, None)
+            if robot is None:
+                continue
+            side_meta = self.demo_data.get(side, dict())
+            part_names = side_meta.get('object_part_names', ['top', 'bottom'])
+            try:
+                object_part_local_idxs = [self.object.link_names.index(name) for name in part_names]
+            except ValueError as exc:
+                print(f"[virtual-force] Missing object part in env for {side}: {exc}")
+                continue
+            guided_mask = torch.ones(meta['num_links'], dtype=torch.bool, device=self.device)
+            if len(keywords) > 0:
+                guided_mask = torch.tensor(
+                    [any(keyword in name.lower() for keyword in keywords) for name in meta['link_names']],
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+            if not guided_mask.any():
+                continue
+            link_global_idxs = [robot.entity.links[idx].idx for idx in meta['link_local_idxs'].tolist()]
+            self.virtual_force_meta[side] = dict(
+                link_names=meta['link_names'],
+                link_local_idxs=meta['link_local_idxs'],
+                link_global_idxs=link_global_idxs,
+                guided_mask=guided_mask,
+                object_part_names=part_names,
+                object_part_local_idxs=object_part_local_idxs,
+                num_links=meta['num_links'],
+            )
+
+        if len(self.virtual_force_meta) == 0:
+            print("[virtual-force] Disabling assist: no matching local contact targets were loaded")
+            self.use_virtual_force_assist = False
+
+    def _clip_link_forces(self, link_force: torch.Tensor, fmax: float) -> torch.Tensor:
+        if fmax <= 0.0:
+            return link_force
+        force_norm = torch.norm(link_force, dim=-1, keepdim=True)
+        scale = torch.clamp(fmax / torch.clamp(force_norm, min=1e-6), max=1.0)
+        return link_force * scale
+
+    def _apply_virtual_force_assist(self, curr_gains: Dict[str, float]):
+        if not self.use_virtual_force_assist or self.object is None:
+            return
+
+        alpha = float(curr_gains.get('vf', self.virtual_force_cfg.get('alpha_init', 0.0)))
+        if alpha <= 0.0:
+            self.extras.setdefault("log", dict())["virtual_force_alpha"] = 0.0
+            return
+
+        delta = float(self.virtual_force_cfg.get('delta', 0.001))
+        kp = float(self.virtual_force_cfg.get('kp', 40.0))
+        kd = float(self.virtual_force_cfg.get('kd', 4.0))
+        sigma = float(self.virtual_force_cfg.get('sigma', 0.03))
+        fmax = float(self.virtual_force_cfg.get('fmax', 1.5))
+
+        object_link_pos = self.object.entity.get_links_pos()
+        object_link_quat = self.object.entity.get_links_quat()
+        total_force_norm = 0.0
+        total_force_count = 0
+
+        for side, meta in self.virtual_force_meta.items():
+            link_pos = self.robots[side].entity.get_links_pos()[:, meta['link_local_idxs'], :]
+            link_vel = self.robots[side].entity.get_links_vel()[:, meta['link_local_idxs'], :]
+            demo_local_pos = self.reward_module.match_demo_state(f"contact_links_local_{side}", self.episode_length_buf)
+            demo_local_normals = self.reward_module.match_demo_state(f"contact_normals_local_{side}", self.episode_length_buf)
+            demo_valid = self.reward_module.match_demo_state(f"contact_links_valid_{side}", self.episode_length_buf).bool()
+
+            side_force = torch.zeros((self.num_envs, meta['num_links'], 3), device=self.device, dtype=torch.float32)
+            guided_mask = meta['guided_mask'].unsqueeze(0)
+            for part_offset, obj_link_idx in enumerate(meta['object_part_local_idxs']):
+                part_pos = object_link_pos[:, obj_link_idx, :]
+                part_quat = object_link_quat[:, obj_link_idx, :]
+                contact_world = points_local_to_world_torch(demo_local_pos[:, part_offset], part_pos, part_quat)
+                normal_world = normals_local_to_world_torch(demo_local_normals[:, part_offset], part_quat)
+                valid_mask = demo_valid[:, part_offset] & guided_mask
+                side_force += compute_virtual_force(
+                    link_pos=link_pos,
+                    link_vel=link_vel,
+                    contact_pos=contact_world,
+                    contact_normal=normal_world,
+                    valid_mask=valid_mask,
+                    alpha=alpha,
+                    delta=delta,
+                    kp=kp,
+                    kd=kd,
+                    sigma=sigma,
+                    fmax=fmax,
+                )
+            side_force = self._clip_link_forces(side_force, fmax)
+            self.rigid_solver.apply_links_external_force(side_force, meta['link_global_idxs'])
+            total_force_norm += torch.norm(side_force, dim=-1).sum().item()
+            total_force_count += side_force.shape[0] * side_force.shape[1]
+
+        self.extras.setdefault("log", dict())["virtual_force_alpha"] = alpha
+        if total_force_count > 0:
+            self.extras["log"]["virtual_force_mean_norm"] = total_force_norm / total_force_count
             
     def build_scene(self):
         env_cfg = self.env_cfg
@@ -442,6 +567,7 @@ class BaseEnv:
         if self.n_objects > 0:
             link_masses = [link.get_mass() for link in self.object.entity.links]
             self.object_mass_buffer = torch.tensor(link_masses, device=self.device, dtype=torch.float32)
+        self._setup_virtual_force_metadata()
         
         self.observe_contact_force = env_cfg.get('observe_contact_force', False)
         if self.n_objects == 0:
@@ -725,6 +851,9 @@ class BaseEnv:
                 comp_force[..., 2] = -self.global_gravity * self.object_mass_buffer * gravity_gain
                 global_link_idxs = [link.idx for link in self.object.entity.links]
                 self.rigid_solver.apply_links_external_force(comp_force, global_link_idxs)
+            self._apply_virtual_force_assist(curr_gains)
+        elif self.use_virtual_force_assist:
+            self._apply_virtual_force_assist(dict(vf=self.virtual_force_cfg.get('alpha_init', 0.0)))
 
         self.randomization.on_step(self.episode_length_buf)
         self.scene.step()  

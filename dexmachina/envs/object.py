@@ -7,6 +7,7 @@ from os.path import join
 from collections import defaultdict
 
 from dexmachina.envs.math_utils import matrix_from_quat 
+from dexmachina.envs.virtual_force import points_world_to_local_np
 from dexmachina.asset_utils import get_asset_path
 
 
@@ -131,6 +132,7 @@ class ArticulatedObject:
         assert len(movable_joints) == 1, f"len(movable_joints)={len(movable_joints)}"
 
         self.texture_meshes = dict()
+        self._part_surface_meshes = None
         if 'texture_meshes' in obj_cfg:
             # add two more meshes for top and bottom
             for part, info in obj_cfg["texture_meshes"].items():
@@ -313,6 +315,37 @@ class ArticulatedObject:
         np.random.seed(seed)
         idxs = np.random.choice(num_vertices, num_samples, replace=replace)
         return torch.tensor(vertices[idxs], dtype=torch.float32)
+
+    def _load_part_surface_meshes(self):
+        if self._part_surface_meshes is not None:
+            return self._part_surface_meshes
+        import trimesh
+        self._part_surface_meshes = dict()
+        for part in ["top", "bottom"]:
+            mesh_fname = self.cfg.get(f"{part}_mesh_fname", None)
+            if mesh_fname is None or not os.path.exists(mesh_fname):
+                continue
+            self._part_surface_meshes[part] = trimesh.load(mesh_fname, force="mesh", process=False)
+        return self._part_surface_meshes
+
+    def query_part_surface_local(self, part: str, points_local: np.ndarray):
+        meshes = self._load_part_surface_meshes()
+        if part not in meshes:
+            raise KeyError(f"Mesh for part '{part}' is not available")
+        mesh = meshes[part]
+        query = np.asarray(points_local, dtype=np.float32)
+        closest_points, _, tri_ids = mesh.nearest.on_surface(query)
+        normals = mesh.face_normals[tri_ids]
+        normals = normals / np.clip(np.linalg.norm(normals, axis=-1, keepdims=True), 1e-8, None)
+        return closest_points.astype(np.float32), normals.astype(np.float32)
+
+    def query_part_surface_world(self, part: str, points_world: np.ndarray, env_idx: int = 0):
+        env_idx = int(env_idx)
+        link_idx = self.link_names.index(part)
+        part_pos = self.part_pos[env_idx, link_idx].detach().cpu().numpy()
+        part_quat = self.part_quat[env_idx, link_idx].detach().cpu().numpy()
+        local_points = points_world_to_local_np(points_world, part_pos, part_quat)
+        return self.query_part_surface_local(part, local_points)
 
     def initialize_value_buffers(self):
         self.root_pos = torch.zeros((self.num_envs, 3), dtype=torch.float32, device=self.device)

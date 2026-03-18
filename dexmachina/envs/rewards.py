@@ -114,6 +114,21 @@ class RewardModule:
                 demo_data[key], dtype=torch.float32, device=device
             )
 
+        optional_demo_keys = [
+            "contact_links_valid_left",
+            "contact_links_valid_right",
+            "contact_links_local_left",
+            "contact_links_local_right",
+            "contact_normals_local_left",
+            "contact_normals_local_right",
+        ]
+        for key in optional_demo_keys:
+            if key not in demo_data:
+                continue
+            self.demo_tensors[key] = torch.tensor(
+                demo_data[key], dtype=torch.float32, device=device
+            )
+
         if self.use_imi_rew:
             for side in ['left', 'right']:
                 key = f"kpts_{side}"

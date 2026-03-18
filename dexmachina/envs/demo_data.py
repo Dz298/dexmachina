@@ -177,14 +177,23 @@ def load_contact_retarget_data(
     retar_contact = dict()
     for side in ['left', 'right']:
         data = loaded[side] 
-        for source_key, target_key in zip(
-            ["dexlink_contacts", "dexlink_valid_contacts"],
-            [f"contact_links_{side}", f"contact_links_valid_{side}"]
-        ):
+        key_map = [
+            ("dexlink_contacts", f"contact_links_{side}"),
+            ("dexlink_valid_contacts", f"contact_links_valid_{side}"),
+            ("dexlink_contacts_local", f"contact_links_local_{side}"),
+            ("dexlink_contact_normals_local", f"contact_normals_local_{side}"),
+        ]
+        for source_key, target_key in key_map:
+            if source_key not in data:
+                continue
             if already_sliced:
                 retar_contact[target_key] = data[source_key]
             else:
                 retar_contact[target_key] = data[source_key][frame_start:frame_end]
-        retar_contact[side] = {key: data[key] for key in ["collision_link_names", "collision_link_local_idxs"]}
+        retar_contact[side] = {
+            key: data[key]
+            for key in ["collision_link_names", "collision_link_local_idxs", "object_part_names"]
+            if key in data
+        }
         
     return retar_contact

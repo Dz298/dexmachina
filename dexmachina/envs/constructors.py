@@ -117,6 +117,16 @@ def get_all_env_cfg(args, device, load_retarget_data=True):
     env_cfg['use_rl_games'] = args.use_rl_games
     env_cfg['rand_init_ratio'] = args.rand_init_ratio  
     env_cfg['chunk_ep_length'] = args.chunk_ep_length
+    env_cfg['use_virtual_force_assist'] = args.use_virtual_force_assist
+    env_cfg['virtual_force_cfg'] = dict(
+        alpha_init=args.virtual_force_alpha_init,
+        delta=args.virtual_force_delta,
+        kp=args.virtual_force_kp,
+        kd=args.virtual_force_kd,
+        sigma=args.virtual_force_sigma,
+        fmax=args.virtual_force_fmax,
+        link_keywords=list(args.virtual_force_link_keywords),
+    )
     
     # Latent world model config
     env_cfg['use_latent_world_model'] = args.use_latent_world_model
@@ -166,7 +176,7 @@ def get_all_env_cfg(args, device, load_retarget_data=True):
         reward_cfg['task_rew_weight'] = 0.0 
         object_cfgs = dict()
 
-    assert len(args.upper_ratios) == len(args.lower_ratios) in [3, 4], "Upper and lower ratios should have length 3 or 4"
+    assert len(args.upper_ratios) == len(args.lower_ratios) in [3, 4, 5], "Upper and lower ratios should have length 3, 4, or 5"
     ups = list(args.upper_ratios)
     lows = list(args.lower_ratios)
     upper_ratios = dict(kp=ups[0], kv=ups[1], fr=ups[2])
@@ -174,6 +184,11 @@ def get_all_env_cfg(args, device, load_retarget_data=True):
     if len(ups) == 4:
         upper_ratios['gravity'] = ups[3]
         lower_ratios['gravity'] = lows[3]
+    elif len(ups) == 5:
+        upper_ratios['gravity'] = ups[3]
+        lower_ratios['gravity'] = lows[3]
+        upper_ratios['vf'] = ups[4]
+        lower_ratios['vf'] = lows[4]
 
     curr_rew_thres = list(args.curr_rew_thres)
     assert len(curr_rew_thres) == 4, "Curriculum reward thresholds should have length 4"
@@ -200,6 +215,7 @@ def get_all_env_cfg(args, device, load_retarget_data=True):
             kv_init=args.kv_init,
             force_range_init=args.force_range_init, 
             gravity_init=args.gravity_init,
+            virtual_force_init=args.virtual_force_alpha_init if args.use_virtual_force_assist else 0.0,
             rew_thresholds=dict(
                 task=curr_rew_thres[0],
                 con=curr_rew_thres[1],
@@ -234,7 +250,8 @@ def get_all_env_cfg(args, device, load_retarget_data=True):
                 kp=args.dialback_ratios[0], 
                 kv=args.dialback_ratios[1], 
                 fr=args.dialback_ratios[2],
-                **({'gravity': args.dialback_ratios[3]} if len(args.dialback_ratios) == 4 else {})
+                **({'gravity': args.dialback_ratios[3]} if len(args.dialback_ratios) >= 4 else {}),
+                **({'vf': args.dialback_ratios[4]} if len(args.dialback_ratios) == 5 else {})
             ),
         )
         curr_cfg = get_curriculum_cfg(curr_kwargs)
@@ -358,12 +375,12 @@ def get_common_argparser():
     parser.add_argument('--curr_rew_thres', type=float, nargs='+', default=[0.5, 0, 0, 0])
     parser.add_argument('--deque_freq', type=int, default=1)
     parser.add_argument('--grad_threshold', type=float, default=0.001)
-    parser.add_argument('--gain_mode', '-gm', type=str, default='all', choices=['all', 'kpkv', 'fr'])
+    parser.add_argument('--gain_mode', '-gm', type=str, default='all', choices=['all', 'kpkv', 'fr', 'gravity', 'vf'])
     
     # uniform-sampling schedule 
     parser.add_argument('--uniform_mode', '-um', type=str, default='slow', choices=['fast', 'slow'])
-    parser.add_argument('--upper_ratios', type=float, nargs='+', default=[0.8, 0.95, 0.95, 0.95])
-    parser.add_argument('--lower_ratios', type=float, nargs='+', default=[0.7, 0.9, 0.9, 0.9])
+    parser.add_argument('--upper_ratios', type=float, nargs='+', default=[0.8, 0.95, 0.95, 0.95, 0.95])
+    parser.add_argument('--lower_ratios', type=float, nargs='+', default=[0.7, 0.9, 0.9, 0.9, 0.9])
     parser.add_argument('--deque_len', type=int, default=30)
     parser.add_argument('--decay_solimp', '-ds', action='store_true')
     parser.add_argument('--solip_multiplier', '-solip', type=float, default=0.95)
@@ -372,7 +389,15 @@ def get_common_argparser():
 
     parser.add_argument('--dialback_ep_len', type=int, default=30)
     parser.add_argument('--dialback_min_epochs', type=int, default=500)
-    parser.add_argument('--dialback_ratios', type=float, nargs='+', default=[0.98, 1.0, 1.0, 0.98])
+    parser.add_argument('--dialback_ratios', type=float, nargs='+', default=[0.98, 1.0, 1.0, 0.98, 0.98])
+    parser.add_argument('--use_virtual_force_assist', '-uvf', action='store_true')
+    parser.add_argument('--virtual_force_alpha_init', type=float, default=0.0)
+    parser.add_argument('--virtual_force_delta', type=float, default=0.001)
+    parser.add_argument('--virtual_force_kp', type=float, default=40.0)
+    parser.add_argument('--virtual_force_kd', type=float, default=4.0)
+    parser.add_argument('--virtual_force_sigma', type=float, default=0.03)
+    parser.add_argument('--virtual_force_fmax', type=float, default=1.5)
+    parser.add_argument('--virtual_force_link_keywords', type=str, nargs='+', default=['thumb', 'index'])
 
     # Latent world model arguments
     parser.add_argument('--use_latent_world_model', '-wm', action='store_true', 

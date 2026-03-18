@@ -9,10 +9,12 @@ import genesis as gs
 import torch
  
 import argparse
+import xml.etree.ElementTree as ET
 from sklearn.neighbors import KDTree 
 from copy import deepcopy
 from collections import defaultdict
 from dexmachina.envs.object import ArticulatedObject, get_arctic_object_cfg 
+from dexmachina.envs.math_utils import matrix_from_quat
 
 from dexmachina.asset_utils import get_asset_path
 """
@@ -156,7 +158,7 @@ def create_scene(args, object_name, urdfs, num_raw_contact_markers=50, num_group
         obj_cfg['fixed'] = False
         obj_cfg['disable_collision'] = True
         obj_cfg['color'] = (1.0, 0.423, 0.039, 0.3)
-        obj = ArticulatedObject(obj_cfg, device=device, scene=scene, num_envs=1)
+        obj = ArticulatedObject(obj_cfg, device=device, scene=scene, num_envs=1, disable_collision=True)
     markers = dict()
     if args.show_grouped_contact_only:
         num_raw_contact_markers = 0
@@ -283,6 +285,150 @@ def group_contacts(links, raw_contacts, valids, num_obj_parts=2):
                 target_positions[has_valid] = mean_pos
     return grouped_contacts, grouped_valids, target_positions
 
+
+def _quat_to_matrix_np(quat_wxyz: np.ndarray) -> np.ndarray:
+    quat = torch.tensor(quat_wxyz, dtype=torch.float32).unsqueeze(0)
+    return matrix_from_quat(quat).squeeze(0).cpu().numpy()
+
+
+def _axis_angle_to_matrix_np(axis: np.ndarray, angle: float) -> np.ndarray:
+    axis = np.asarray(axis, dtype=np.float32)
+    axis_norm = np.linalg.norm(axis)
+    if axis_norm < 1e-8 or abs(angle) < 1e-8:
+        return np.eye(3, dtype=np.float32)
+    axis = axis / axis_norm
+    x, y, z = axis
+    c = np.cos(angle)
+    s = np.sin(angle)
+    C = 1.0 - c
+    return np.array([
+        [c + x * x * C, x * y * C - z * s, x * z * C + y * s],
+        [y * x * C + z * s, c + y * y * C, y * z * C - x * s],
+        [z * x * C - y * s, z * y * C + x * s, c + z * z * C],
+    ], dtype=np.float32)
+
+
+def _rpy_to_matrix_np(rpy: np.ndarray) -> np.ndarray:
+    roll, pitch, yaw = [float(x) for x in rpy]
+    cr, sr = np.cos(roll), np.sin(roll)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]], dtype=np.float32)
+    ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]], dtype=np.float32)
+    rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]], dtype=np.float32)
+    return rz @ ry @ rx
+
+
+class ArcticObjectMeshHelper:
+    def __init__(self, object_name: str):
+        import trimesh
+
+        self.cfg = get_arctic_object_cfg(object_name)
+        self.meshes = {
+            "bottom": trimesh.load(self.cfg["bottom_mesh_fname"], force="mesh", process=False),
+            "top": trimesh.load(self.cfg["top_mesh_fname"], force="mesh", process=False),
+        }
+        self.joint_origin_xyz = np.zeros(3, dtype=np.float32)
+        self.joint_origin_rpy = np.zeros(3, dtype=np.float32)
+        self.joint_axis = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        self._load_joint_from_urdf(self.cfg["urdf_path"])
+
+    def _load_joint_from_urdf(self, urdf_path: str):
+        root = ET.parse(urdf_path).getroot()
+        for joint in root.findall("joint"):
+            parent = joint.find("parent")
+            child = joint.find("child")
+            if parent is None or child is None:
+                continue
+            if parent.attrib.get("link") != "bottom" or child.attrib.get("link") != "top":
+                continue
+            origin = joint.find("origin")
+            if origin is not None:
+                if "xyz" in origin.attrib:
+                    self.joint_origin_xyz = np.fromstring(origin.attrib["xyz"], sep=" ", dtype=np.float32)
+                if "rpy" in origin.attrib:
+                    self.joint_origin_rpy = np.fromstring(origin.attrib["rpy"], sep=" ", dtype=np.float32)
+            axis = joint.find("axis")
+            if axis is not None and "xyz" in axis.attrib:
+                self.joint_axis = np.fromstring(axis.attrib["xyz"], sep=" ", dtype=np.float32)
+            break
+
+    def get_part_pose(self, part: str, root_pos: np.ndarray, root_quat: np.ndarray, joint_qpos: float):
+        root_pos = np.asarray(root_pos, dtype=np.float32)
+        root_rot = _quat_to_matrix_np(np.asarray(root_quat, dtype=np.float32))
+        if part == "bottom":
+            return root_pos, root_rot
+        joint_rot = _axis_angle_to_matrix_np(self.joint_axis, float(joint_qpos))
+        origin_rot = _rpy_to_matrix_np(self.joint_origin_rpy)
+        part_rot = root_rot @ origin_rot @ joint_rot
+        part_pos = root_pos + root_rot @ self.joint_origin_xyz
+        return part_pos, part_rot
+
+    def query_part_surface_world(self, part: str, points_world: np.ndarray, root_pos: np.ndarray, root_quat: np.ndarray, joint_qpos: float):
+        mesh = self.meshes[part]
+        part_pos, part_rot = self.get_part_pose(part, root_pos, root_quat, joint_qpos)
+        points_world = np.asarray(points_world, dtype=np.float32)
+        points_local = (points_world - part_pos[None]) @ part_rot
+        closest_local, _, tri_ids = mesh.nearest.on_surface(points_local)
+        normals_local = mesh.face_normals[tri_ids]
+        normals_local = normals_local / np.clip(np.linalg.norm(normals_local, axis=-1, keepdims=True), 1e-8, None)
+        return closest_local.astype(np.float32), normals_local.astype(np.float32)
+
+
+def get_part_name_from_id(part_id: int) -> str:
+    if int(part_id) == 1:
+        return "top"
+    if int(part_id) == 2:
+        return "bottom"
+    raise ValueError(f"Invalid ARCTIC part id: {part_id}")
+
+
+def compute_local_contact_targets(raw_contacts, valids, mesh_helper, obj_state):
+    local_positions = np.zeros((raw_contacts.shape[0], 3), dtype=np.float32)
+    local_normals = np.zeros((raw_contacts.shape[0], 3), dtype=np.float32)
+    if not np.any(valids):
+        return local_positions, local_normals
+
+    for part_id in [1, 2]:
+        mask = valids & (raw_contacts[:, 3] == part_id)
+        if not np.any(mask):
+            continue
+        part_name = get_part_name_from_id(part_id)
+        closest_local, normals_local = mesh_helper.query_part_surface_world(
+            part_name,
+            raw_contacts[mask, :3],
+            root_pos=obj_state["root_pos"],
+            root_quat=obj_state["root_quat"],
+            joint_qpos=obj_state["joint_qpos"],
+        )
+        local_positions[mask] = closest_local
+        local_normals[mask] = normals_local
+    return local_positions, local_normals
+
+
+def group_local_contact_targets(links, raw_contacts, valids, local_positions, local_normals, num_obj_parts=2):
+    aabbs = [link.get_AABB()[0].cpu().numpy() for link in links]
+    link_center_pos = np.array([0.5 * (aabb[0] + aabb[1]) for aabb in aabbs])
+    kdtree = KDTree(link_center_pos)
+    _, indices = kdtree.query(raw_contacts[:, :3], k=1)
+    indices[~valids] = -1
+
+    nlinks = len(links)
+    grouped_local_positions = np.zeros((num_obj_parts, nlinks, 3), dtype=np.float32)
+    grouped_local_normals = np.zeros((num_obj_parts, nlinks, 3), dtype=np.float32)
+    for i in range(nlinks):
+        for j in range(num_obj_parts):
+            part_id = j + 1
+            matched = (indices == i).flatten() & (raw_contacts[:, 3] == part_id) & valids
+            if np.sum(matched) == 0:
+                continue
+            grouped_local_positions[j, i] = np.mean(local_positions[matched], axis=0)
+            mean_normal = np.mean(local_normals[matched], axis=0)
+            norm = np.linalg.norm(mean_normal)
+            if norm > 1e-8:
+                grouped_local_normals[j, i] = mean_normal / norm
+    return grouped_local_positions, grouped_local_normals
+
 def set_entities_to_step(hand_entities, retargeter_results, step):
     for side, hand in hand_entities.items():
         hand_qpos = retargeter_results[side]["hand_qpos"][step]
@@ -368,6 +514,7 @@ if __name__ == "__main__":
         "root_quat": loaded_data['params']['obj_quat'],
         "joint_qpos": loaded_data['params']['obj_arti'],
     }
+    mesh_helper = ArcticObjectMeshHelper(object_name)
 
     if args.show_mano_plt:
         contacts_left = loaded_data['world_coord']["contact_links_left"]
@@ -414,7 +561,7 @@ if __name__ == "__main__":
     saved_contacts = False
     while True:
         set_entities_to_step(hand_entities, retargeter_results, step) 
-        if args.show_object:
+        if obj is not None:
             set_object_to_step(obj, obj_states, step)
         
         # raw_contacts = [loaded_data['world_coord'][f"contacts.{side}"][step] for side in hand_entities.keys()]
@@ -423,17 +570,36 @@ if __name__ == "__main__":
         # scene.step() 
         grouped_contacts = dict()
         grouped_valids = dict()
+        grouped_contacts_local = dict()
+        grouped_normals_local = dict()
         target_pos = dict()
         for side, hand in hand_entities.items():
             raw_contacts = loaded_data['world_coord'][f"contacts.{side}"]
             valid_contacts = loaded_data['world_coord'][f"valid_contacts.{side}"]
+            local_positions, local_normals = compute_local_contact_targets(
+                raw_contacts[step],
+                valid_contacts[step],
+                mesh_helper,
+                dict(
+                    root_pos=obj_states["root_pos"][step],
+                    root_quat=obj_states["root_quat"][step],
+                    joint_qpos=float(obj_states["joint_qpos"][step]),
+                ),
+            )
             hand_link_contacts, hand_link_valids, target_positions = group_contacts(
                 collision_links[side], raw_contacts[step], valid_contacts[step]
             )
+            hand_link_contacts_local, hand_link_normals_local = group_local_contact_targets(
+                collision_links[side], raw_contacts[step], valid_contacts[step], local_positions, local_normals
+            )
             grouped_contacts[side] = hand_link_contacts # shape (num_obj_parts, num_dex_links, 4)
             grouped_valids[side] = hand_link_valids
+            grouped_contacts_local[side] = hand_link_contacts_local
+            grouped_normals_local[side] = hand_link_normals_local
             tosave[side]['dexlink_contacts'].append(hand_link_contacts)
             tosave[side]['dexlink_valid_contacts'].append(hand_link_valids)
+            tosave[side]['dexlink_contacts_local'].append(hand_link_contacts_local)
+            tosave[side]['dexlink_contact_normals_local'].append(hand_link_normals_local)
             target_pos[side] = target_positions
 
         if args.num_markers > 0: 
@@ -476,6 +642,7 @@ if __name__ == "__main__":
                     link_local_idxs = [link.idx_local for link in links]
                     tosave[side]['collision_link_names'] = link_names
                     tosave[side]['collision_link_local_idxs'] = link_local_idxs
+                    tosave[side]['object_part_names'] = ['top', 'bottom']
                 
                 if not args.render_only:
                     np.save(save_fname, tosave)
@@ -493,4 +660,3 @@ if __name__ == "__main__":
                 saved_vid = True
                 break
     exit()
-

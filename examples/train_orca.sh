@@ -5,11 +5,11 @@ HAND=orca_hand
 CLIP=ketchup-30-130
 
 # Full run with thumb weighting (5000 epochs) + latent world model
-EXP_NAME=true_hybrid_start_stable_gravity_comp_stiffer_hand_gains
+EXP_NAME=hybrid_start_stable_gravity_comp_vfassist
 python dexmachina/rl/train_rl_games.py -B 6000 -obf -obt --max_epochs 5000 \
     --actuate_object --retarget_name para --horizon 16 -imw 0.5 --gain_mode all \
     --curr_schedule uniform --wait_epochs 100 --learning_rate 0.0003 \
-    --upper_ratios 0.9 0.9 1 0.95 --lower_ratios 0.8 0.8 1 0.9 \
+    --upper_ratios 0.9 0.9 1 0.95 0.95 --lower_ratios 0.8 0.8 1 0.9 0.9 \
     --save_freq 5000 --group_collisions --fixed_mode uniform --uniform_mode slow \
     --action_penalty 0.01 --dialback_ep_len 80 --skip_grad --deque_len 30 \
     --task_rew_betas 10 1 5 --use_retarget_contact \
@@ -17,6 +17,10 @@ python dexmachina/rl/train_rl_games.py -B 6000 -obf -obt --max_epochs 5000 \
     -am hybrid \
     -ert 0.4 --contact_beta 10 \
     --hybrid_scales 0.1 1.0 --kp_init 80 --kv_init 5 \
+    --use_virtual_force_assist --virtual_force_alpha_init 1.0 \
+    --virtual_force_delta 0.001 --virtual_force_kp 40 --virtual_force_kd 4 \
+    --virtual_force_sigma 0.03 --virtual_force_fmax 1.5 \
+    --virtual_force_link_keywords thumb index \
     --thumb_weight 4.0 \
     --clip $CLIP -imi 0.3 -bc 0.3 -con 10 -exp $EXP_NAME --hand $HAND 
     # --use_latent_world_model --wm_latent_dim 64 
@@ -60,4 +64,3 @@ python dexmachina/rl/train_rl_games.py -B 6000 -obf -obt --max_epochs 5000 \
 #     --base_policy_path $BASE_POLICY_PATH \
 #     --thumb_weight 4.0 \
 #     --clip $CLIP -imi 0.3 -bc 0.3 -con 10 -ert 0.6 -exp $EXP_NAME --hand $HAND
-

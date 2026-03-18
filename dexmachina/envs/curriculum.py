@@ -10,6 +10,7 @@ def get_curriculum_cfg(kwargs=dict()):
         "kv_init": 10.0,
         "force_range_init": 50.0, 
         "gravity_init": 1.0,
+        "virtual_force_init": 0.0,
         "wait_epochs": 2000,
         "decay_rew": False,
         "schedule": "exp", # or exp or uniform 
@@ -29,8 +30,8 @@ def get_curriculum_cfg(kwargs=dict()):
         "uniform_mode": "fast", # or slow
         # "upper_ratio": 0.9, # upper = curr_upper * (upper_ratio)
         # "lower_ratio": 0.8, # if fast: lower=curr_lower * lower_ratio, if slow: lower=curr_upper * lower_ratio
-        "upper_ratios": dict(kp=0.5, kv=0.9, fr=0.95, gravity=0.95),
-        "lower_ratios": dict(kp=0.5, kv=0.8, fr=0.9, gravity=0.9),
+        "upper_ratios": dict(kp=0.5, kv=0.9, fr=0.95, gravity=0.95, vf=0.95),
+        "lower_ratios": dict(kp=0.5, kv=0.8, fr=0.9, gravity=0.9, vf=0.9),
         "seed": 42,
         "decay_solimp": False,
         "solip_multiplier": 0.98,
@@ -62,6 +63,7 @@ class Curriculum:
             "kv": curr_cfg['kv_init'],
             "fr": curr_cfg['force_range_init'],
             "gravity": curr_cfg.get('gravity_init', 1.0),
+            "vf": curr_cfg.get('virtual_force_init', 0.0),
         }
         self.curr_gains = self.init_gains.copy()
         self.curr_gains_lower = self.init_gains.copy() # use for uniform mode
@@ -72,6 +74,8 @@ class Curriculum:
         decay_terms = []
         if self.gain_mode == "all":
             decay_terms = ["kp", "kv", "fr", "gravity"]
+            if self.init_gains.get("vf", 0.0) > 0.0:
+                decay_terms.append("vf")
         elif "kp" in self.gain_mode:
             decay_terms.append("kp")
         elif "kv" in self.gain_mode:
@@ -80,6 +84,8 @@ class Curriculum:
             decay_terms.append("fr")
         elif "gravity" in self.gain_mode:
             decay_terms.append("gravity")
+        elif "vf" in self.gain_mode:
+            decay_terms.append("vf")
         else:
             raise ValueError("Invalid gain mode")
         self.decay_terms = decay_terms
@@ -105,8 +111,8 @@ class Curriculum:
         self.tconst_lower = curr_cfg['tconst_lower']
         self.tconst_upper = curr_cfg['tconst_upper']
 
-        self.upper_ratios = curr_cfg.get('upper_ratios', dict(kp=0.9, kv=0.9, fr=0.9))
-        self.lower_ratios = curr_cfg.get('lower_ratios', dict(kp=0.8, kv=0.8, fr=0.8))
+        self.upper_ratios = curr_cfg.get('upper_ratios', dict(kp=0.9, kv=0.9, fr=0.9, vf=0.9))
+        self.lower_ratios = curr_cfg.get('lower_ratios', dict(kp=0.8, kv=0.8, fr=0.8, vf=0.8))
 
         self.rew_deques = dict()
         self.rew_grads = dict() 
@@ -184,6 +190,7 @@ class Curriculum:
                     "kv": self.init_gains['kv'] * (1 - frac) + mid_gains['kv'] * frac,
                     "fr": self.init_gains['fr'] * (1 - frac) + mid_gains['fr'] * frac,
                     "gravity": self.init_gains['gravity'] * (1 - frac) + mid_gains['gravity'] * frac,
+                    "vf": self.init_gains['vf'] * (1 - frac) + mid_gains['vf'] * frac,
                 }
             elif epoch_num < second_stop:
                 frac = (epoch_num - first_stop) / (second_stop - first_stop)
@@ -192,6 +199,7 @@ class Curriculum:
                     "kv": mid_gains['kv'] * (1 - frac),
                     "fr": mid_gains['fr'] * (1 - frac),
                     "gravity": mid_gains['gravity'] * (1 - frac),
+                    "vf": mid_gains['vf'] * (1 - frac),
                 }
             else:
                 new_gains = {k: 0.0 for k in self.init_gains}
@@ -275,6 +283,8 @@ class Curriculum:
             new_gains[k] = v * ratio
         if self._should_zero_all_gains(new_gains):
             new_gains = {k: 0.0 for k in new_gains}
+        elif "vf" in new_gains and new_gains["vf"] < 1e-4:
+            new_gains["vf"] = 0.0
         for k in self.decay_terms:
             self.curr_gains[k] = new_gains[k]
         return True, ""
@@ -302,6 +312,9 @@ class Curriculum:
                 self.curr_gains[k] = 0.0
                 self.curr_gains_lower[k] = 0.0
             self.low_ratio = 0.0 
+        if 'vf' in self.decay_terms and self.curr_gains.get('vf', 0.0) < 1e-4:
+            self.curr_gains['vf'] = 0.0
+            self.curr_gains_lower['vf'] = 0.0
         # if the lower bound kp is within 0.1 thres, reduce it to 0 
         if ('kp' in self.decay_terms and self.curr_gains_lower.get('kp', 1) < 0.1):
             for k in self.decay_terms:
@@ -334,27 +347,29 @@ class Curriculum:
 
     def reset_object_gains(self):
         rand_gains = dict()
+        object_decay_terms = [k for k in self.decay_terms if k in ["kp", "kv", "fr"]]
         if self.schedule == "uniform" or self.fixed_mode == "uniform":
-            if any([self.curr_gains[key] == 0 for key in self.decay_terms]):
-                rand_gains = {k: 0.0 for k in self.decay_terms}
+            if any([self.curr_gains[key] == 0 for key in object_decay_terms]):
+                rand_gains = {k: 0.0 for k in object_decay_terms}
             else:
                 # sample for every joint dim and env dim! shape should be (num_envs, num_joints)
-                for key in self.decay_terms:
+                for key in object_decay_terms:
                     lower = self.curr_gains_lower[key]
                     upper = self.curr_gains[key] 
                     # uniform from lower to upper, sample shape (num_envs, num_joints)
                     rand_gains[key] = torch.rand((self.num_envs, self.obj_ndof), dtype=torch.float32) * (upper - lower) + lower   
         else:
             # same params for all 
-            for key in self.decay_terms:
+            for key in object_decay_terms:
                 rand_gains[key] = self.curr_gains[key] 
         # this should handle missing shapes:
-        self.object.set_joint_gains(
-            kp=rand_gains.get("kp", None),
-            kv=rand_gains.get("kv", None),
-            force_range=rand_gains.get("fr", None),
-            env_idxs=None,
-        )
+        if len(object_decay_terms) > 0:
+            self.object.set_joint_gains(
+                kp=rand_gains.get("kp", None),
+                kv=rand_gains.get("kv", None),
+                force_range=rand_gains.get("fr", None),
+                env_idxs=None,
+            )
     
     def reset_solimp(self): 
         self.tconst_upper = max(self.tconst_upper * self.solip_multiplier, 0.02)
