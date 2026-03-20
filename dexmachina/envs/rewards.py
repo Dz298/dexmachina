@@ -366,11 +366,11 @@ class RewardModule:
 
         imi_rew *= self.imi_rew_weight
         rew_dict = dict(
-            kpts_dist_left=kpt_dists_per_side.get("left"),
-            kpts_dist_right=kpt_dists_per_side.get("right"),
             imi_rew=imi_rew,
             keypoint_dist=keypoint_dist,
         )
+        for side, dist in kpt_dists_per_side.items():
+            rew_dict[f"kpts_dist_{side}"] = dist
         if self.last_n_frame > 0:
             tomask = torch.where(
                 episode_length_buf < self.demo_length - self.last_n_frame,

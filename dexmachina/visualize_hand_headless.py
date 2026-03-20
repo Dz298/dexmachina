@@ -21,6 +21,32 @@ from dexmachina.retargeting.coordinate_utils import apply_dexycb_display_to_load
 RETARGET_DIR = get_asset_path("retargeted")
 
 
+def infer_active_sides(loaded_data, retarget_data, motion_eps=1e-3, value_eps=1e-8):
+    """Infer which saved hands are actually active, preferring demo contact then robot motion."""
+    demo_data = loaded_data.get("demo_data", {})
+    active = []
+
+    for side in retarget_data:
+        contact_key = f"contact_links_{side}"
+        contacts = demo_data.get(contact_key)
+        if contacts is not None:
+            contacts = np.asarray(contacts)
+            if contacts.size > 0 and np.any(np.abs(contacts) > value_eps):
+                active.append(side)
+                continue
+
+        side_data = loaded_data.get("retarget_data", {}).get(side, {})
+        kpt_pos = side_data.get("kpt_pos")
+        if kpt_pos is not None:
+            if isinstance(kpt_pos, torch.Tensor):
+                kpt_pos = kpt_pos.detach().cpu().numpy()
+            flat = np.asarray(kpt_pos).reshape(np.asarray(kpt_pos).shape[0], -1)
+            if flat.size > 0 and float(np.mean(np.std(flat, axis=0))) > motion_eps:
+                active.append(side)
+
+    return active if active else list(retarget_data.keys())
+
+
 def create_headless_scene(num_envs, robot_cfgs, object_cfg, demo_data, device=torch.device("cuda")):
     """Create a headless scene that can render without display"""
     scene_cfg = dict(
@@ -75,11 +101,9 @@ def create_headless_scene(num_envs, robot_cfgs, object_cfg, demo_data, device=to
         visualize_contact=True,
     )
     
-    # Add camera BEFORE building scene
-    # Position camera to see hands and object properly
-    # Hands are around height z=1.0-1.3, x=±0.6
+    # Add camera BEFORE building scene (aligned with eval_rl_games front camera for centered framing)
     camera = scene.add_camera(
-        pos=(1.5, -1.5, 1.3),  # Further back and at hand height
+        pos=(-0.5, -0.4, 1.3),  # Further back and at hand height
         lookat=(0, 0.4, 1.15),  # Look at center between hands
         res=(1280, 720),
         fov=65,
@@ -118,8 +142,9 @@ def main(args):
     apply_dexycb_display_to_loaded_pt(loaded_data)
     retarget_data = loaded_data['retargeter_results']
     demo_data = loaded_data['demo_data']
-    sides = list(retarget_data.keys())
+    sides = infer_active_sides(loaded_data, retarget_data)
     first_side = sides[0]
+    print(f"Using active sides for visualization: {sides}")
 
     # Get number of steps
     num_steps = len(retarget_data[first_side]['hand_qpos'])
@@ -144,10 +169,13 @@ def main(args):
     # Setup robot configs (only for sides present in retarget data)
     num_envs = 1  # Only need 1 env for video rendering
     robot_cfgs = dict()
-    render_sides = sides if args.both_hands else [args.hand_side]
-    render_sides = [s for s in render_sides if s in sides]
-    if not render_sides:
-        render_sides = sides
+    if args.both_hands:
+        render_sides = list(sides)
+    elif args.hand_side in sides:
+        render_sides = [args.hand_side]
+    else:
+        render_sides = [first_side]
+        print(f"Requested hand_side={args.hand_side} is inactive/unavailable; falling back to {first_side}")
 
     for side in render_sides:
         cfg = get_default_robot_cfg(name=hand_name, side=side)
@@ -285,7 +313,7 @@ if __name__ == '__main__':
                         help='Hand name')
     parser.add_argument('--hand_side', type=str, default='left', choices=['left', 'right'],
                         help='Which hand to show (if --both_hands is False)')
-    parser.add_argument('--both_hands', '-b', action='store_true', default=True,
+    parser.add_argument('--both_hands', '-b', action='store_true', default=False,
                         help='Show both hands')
     
     # Rendering options

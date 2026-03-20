@@ -39,6 +39,14 @@ def gather_object_state_tensor(demo_data):
     arr = np.concatenate([obj_pos, obj_quat, obj_arti], axis=1)
     return torch.tensor(arr).float()
 
+
+def get_eval_hands(uenv):
+    active_sides = list(getattr(uenv, "active_sides", []) or uenv.robots.keys())
+    hands = {side: uenv.robots[side] for side in active_sides if side in uenv.robots}
+    if not hands:
+        raise KeyError("No active hands found in evaluation environment")
+    return hands
+
 def eval_one_episode(env, agent, obj_state_tensor, print_rew=False, record_video=False, show_reference=False):
     obs = env.reset() 
     if isinstance(obs, dict):
@@ -64,10 +72,8 @@ def eval_one_episode(env, agent, obj_state_tensor, print_rew=False, record_video
             print("Setting eval time obj gains to 0.0")
             obj.set_joint_gains(0.0, 0.0, force_range=0.0)
     assert obj is not None, "No object found in the environment"
-    left_hand = uenv.robots["left"]
-    right_hand = uenv.robots["right"]
-    joint_target_left = left_hand.residual_qpos
-    joint_target_right = right_hand.residual_qpos
+    eval_hands = get_eval_hands(uenv)
+    joint_targets = {side: hand.residual_qpos for side, hand in eval_hands.items()}
     
     eval_data = defaultdict(list)
     for i in range(ep_len):
@@ -78,17 +84,21 @@ def eval_one_episode(env, agent, obj_state_tensor, print_rew=False, record_video
             demo_state = obj_state_tensor[env_step]
                     
             if show_reference: # visualize the demo traj and set zero action
+                ref_env_idx = 1 if num_envs > 1 else 0
                 obj.set_object_state(
                     root_pos=demo_state[:3][None],
                     root_quat=demo_state[3:7][None],
                     joint_qpos=demo_state[7][None],
-                    env_idxs=torch.tensor([1], dtype=torch.int32, device=device),
+                    env_idxs=torch.tensor([ref_env_idx], dtype=torch.int32, device=device),
                 )
-                actions[-1, :] = -1.0 
-                for robot, joints in zip([left_hand, right_hand], [joint_target_left, joint_target_right]):
+                actions[ref_env_idx, :] = -1.0 
+                for side, robot in eval_hands.items():
+                    joints = joint_targets.get(side)
+                    if joints is None:
+                        continue
                     robot.set_joint_position(
                         joint_targets=joints[env_step][None],
-                        env_idxs=[1],
+                        env_idxs=[ref_env_idx],
                     ) 
             obs, rew, dones, infos = env.step(actions) 
             obj_pos, obj_quat, obj_arti = obj.root_pos, obj.root_quat, obj.dof_pos
@@ -182,11 +192,12 @@ def main():
     env_kwargs['rand_cfg']['randomize'] = False 
 
     if args.show_markers:
+        hand_sides = list(env_kwargs["robot_cfgs"].keys())
         marker_cfgs = get_contact_marker_cfgs(
                 num_vis_contacts=16,
                 sources=['demo'],
                 obj_parts=['top', 'bottom'],
-                hand_sides=['left', 'right'],
+                hand_sides=hand_sides,
             )
         env_kwargs['contact_marker_cfgs'] = marker_cfgs
         print('Setting visualize contact to True but observe contact force to False')
@@ -288,4 +299,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

@@ -8,7 +8,7 @@ from dexmachina.envs.maniptrans_curr import get_maniptrans_cfg
 from dexmachina.envs.object import ArticulatedObject, get_arctic_object_cfg, get_ycb_object_cfg
 from dexmachina.envs.robot import BaseRobot, get_default_robot_cfg
 from dexmachina.envs.rewards import RewardModule, get_reward_cfg
-from dexmachina.envs.demo_data import get_demo_data, load_genesis_retarget_data 
+from dexmachina.envs.demo_data import get_demo_data, load_genesis_retarget_data, resolve_hand_sides 
 
 def parse_clip_string(clip):
     vals = clip.split("-")
@@ -94,6 +94,14 @@ def get_all_env_cfg(args, device, load_retarget_data=True):
     args.arctic_object = obj_name
     args.frame_start = start
     args.frame_end = end
+    resolved_hand_sides = resolve_hand_sides(
+        hand_sides=hand_sides_arg,
+        obj_name=obj_name,
+        subject_name=subject,
+        use_clip=use_clip,
+        data_source=data_source,
+        sequence_id=sequence_id,
+    )
 
     retarget_data = dict()
     if args.use_teleop and load_retarget_data:
@@ -109,7 +117,7 @@ def get_all_env_cfg(args, device, load_retarget_data=True):
                 save_name=args.retarget_name,
                 use_clip=use_clip,
                 subject_name=subject,
-                hand_sides=hand_sides_arg,
+                hand_sides=resolved_hand_sides,
             )
         demo_data = get_demo_data(
             obj_name=args.arctic_object,
@@ -119,12 +127,12 @@ def get_all_env_cfg(args, device, load_retarget_data=True):
             use_clip=use_clip,
             subject_name=subject,
             load_retarget_contact=args.use_retarget_contact,
-            hand_sides=hand_sides_arg,
+            hand_sides=resolved_hand_sides,
             data_source=data_source,
             sequence_id=sequence_id,
         )
 
-    hand_sides = hand_sides_arg
+    hand_sides = resolved_hand_sides
     if hand_sides is None:
         hand_sides = list(retarget_data.keys()) if retarget_data else ["left", "right"]
     if not hand_sides:

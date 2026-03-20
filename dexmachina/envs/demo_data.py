@@ -11,17 +11,77 @@ RETARGET_DIR = get_asset_path("retargeted")
 RETARGET_CONTACT_DIR = get_asset_path("contact_retarget")
 
 
-def _infer_hand_sides_from_world_coord(world_coord):
-    """Infer which hands have valid data from world_coord keys and content."""
-    sides = []
+def _get_processed_demo_fname(
+    obj_name="box",
+    subject_name="s01",
+    use_clip="01",
+    data_source="arctic",
+    data_fname=None,
+    sequence_id=None,
+):
+    if data_fname is not None:
+        return str(data_fname)
+    if data_source == "dexycb":
+        if sequence_id is None:
+            sequence_id = obj_name
+        return str(f"{DEXYCB_PROCESSED_DIR}/{subject_name}/{sequence_id}.npy")
+    return str(f"{ARCTIC_PROCESSED_DIR}/{subject_name}/{obj_name}_use_{use_clip}.npy")
+
+
+def _infer_hand_sides_from_world_coord(world_coord, motion_eps=1e-4, value_eps=1e-8):
+    """Infer active hand sides from processed joints, preferring hands that actually move."""
+    side_stats = {}
     for side in ("left", "right"):
         key = f"joints.{side}"
         if key not in world_coord:
             continue
-        arr = world_coord[key]
-        if arr.size > 0 and np.any(np.abs(arr) > 1e-8):
-            sides.append(side)
-    return sides if sides else ["left", "right"]
+        arr = np.asarray(world_coord[key])
+        if arr.size == 0:
+            continue
+        flat = arr.reshape(arr.shape[0], -1) if arr.ndim > 1 else arr.reshape(-1, 1)
+        side_stats[side] = {
+            "has_signal": bool(np.any(np.abs(flat) > value_eps)),
+            "motion": float(np.mean(np.std(flat, axis=0))) if flat.shape[0] > 1 else 0.0,
+        }
+
+    moving_sides = [side for side, stats in side_stats.items() if stats["motion"] > motion_eps]
+    if moving_sides:
+        return moving_sides
+
+    present_sides = [side for side, stats in side_stats.items() if stats["has_signal"]]
+    if present_sides:
+        return present_sides
+
+    return ["left", "right"]
+
+
+def resolve_hand_sides(
+    hand_sides=None,
+    obj_name="box",
+    subject_name="s01",
+    use_clip="01",
+    data_source="arctic",
+    data_fname=None,
+    sequence_id=None,
+):
+    """Resolve active hand sides from the processed demo unless the caller overrides them."""
+    if hand_sides is not None:
+        return list(hand_sides)
+
+    demo_fname = _get_processed_demo_fname(
+        obj_name=obj_name,
+        subject_name=subject_name,
+        use_clip=use_clip,
+        data_source=data_source,
+        data_fname=data_fname,
+        sequence_id=sequence_id,
+    )
+    if not os.path.exists(demo_fname):
+        return ["left", "right"]
+
+    raw = np.load(demo_fname, allow_pickle=True).item()
+    world_coord = raw["world_coord"]
+    return _infer_hand_sides_from_world_coord(world_coord)
 
 
 def get_demo_data(
@@ -38,23 +98,28 @@ def get_demo_data(
     sequence_id=None,
 ):
     """Load processed demo data (ARCTIC or DexYCB). Returns only data for present hand_sides."""
-    if data_fname is not None:
-        demo_fname = data_fname
-    elif data_source == "dexycb":
-        if sequence_id is None:
-            sequence_id = obj_name
-        demo_fname = f"{DEXYCB_PROCESSED_DIR}/{subject_name}/{sequence_id}.npy"
-        demo_fname = str(demo_fname)
-    else:
-        demo_fname = f"{ARCTIC_PROCESSED_DIR}/{subject_name}/{obj_name}_use_{use_clip}.npy"
-        demo_fname = str(demo_fname)
+    demo_fname = _get_processed_demo_fname(
+        obj_name=obj_name,
+        subject_name=subject_name,
+        use_clip=use_clip,
+        data_source=data_source,
+        data_fname=data_fname,
+        sequence_id=sequence_id,
+    )
 
     raw = np.load(demo_fname, allow_pickle=True).item()
     world_coord = raw["world_coord"]
     params = raw["params"]
 
     if hand_sides is None:
-        hand_sides = _infer_hand_sides_from_world_coord(world_coord)
+        hand_sides = resolve_hand_sides(
+            obj_name=obj_name,
+            subject_name=subject_name,
+            use_clip=use_clip,
+            data_source=data_source,
+            data_fname=demo_fname,
+            sequence_id=sequence_id,
+        )
 
     demo_data = {
         "obj_pos": params["obj_trans"][frame_start:frame_end],

@@ -7,10 +7,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 HAND=orca_hand
+# HAND=inspire_hand
 SUBJECT=20200709-subject-01
-SEQUENCE_ID=20200709_141754
+SEQUENCE_ID=20200709_142211
 CLIP="${SUBJECT}/${SEQUENCE_ID}-0-72"
 
+## If the .npy file is not already processed, run the following:
 # 1. Process DexYCB sequence to .npy (Genesis frame)
 python retargeting/process_dexycb.py --sequence ${SUBJECT}/${SEQUENCE_ID} --save -ow
 

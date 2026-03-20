@@ -11,7 +11,7 @@ from pathlib import Path
 from copy import deepcopy
 
 from dexmachina.asset_utils import get_asset_path
-from dexmachina.envs.demo_data import get_demo_data, _infer_hand_sides_from_world_coord
+from dexmachina.envs.demo_data import get_demo_data, resolve_hand_sides
 from dexmachina.envs.base_env import BaseEnv, get_env_cfg
 from dexmachina.envs.robot import BaseRobot, get_default_robot_cfg
 from dexmachina.envs.object import ArticulatedObject, get_arctic_object_cfg, get_ycb_object_cfg
@@ -209,7 +209,14 @@ def prepare_cfgs(
     object_cfgs = {obj_name: obj_cfg}
 
     if hand_sides is None:
-        hand_sides = ["left", "right"]
+        hand_sides = resolve_hand_sides(
+            obj_name=obj_name,
+            subject_name=subject_name,
+            use_clip=use_clip,
+            data_source=data_source,
+            data_fname=input_fname,
+            sequence_id=sequence_id,
+        )
     robot_cfgs = dict()
     print("Setting action mode to absolute and setting collect_data to True")
     for side in hand_sides:
@@ -252,7 +259,7 @@ def prepare_retarget_cfgs(
     world_data = loaded["world_coord"]
 
     if hand_sides is None:
-        hand_sides = _infer_hand_sides_from_world_coord(world_data)
+        hand_sides = resolve_hand_sides(data_fname=input_fname)
 
     if "mano" in hand_name:
         config_path = get_asset_path("mano_hand/retarget_config.yaml")
@@ -403,11 +410,15 @@ def main(args):
         input_fname = join(PROCESSED_DATADIR, f"{subject_name}/{obj_name}_use_{use_clip}.npy")
         input_fname = str(input_fname)
 
-    if os.path.exists(input_fname):
-        loaded = np.load(input_fname, allow_pickle=True).item()
-        hand_sides = _infer_hand_sides_from_world_coord(loaded["world_coord"])
-    else:
-        hand_sides = getattr(args, "hand_sides", None) or ["left", "right"]
+    hand_sides = resolve_hand_sides(
+        hand_sides=getattr(args, "hand_sides", None),
+        obj_name=obj_name,
+        subject_name=subject_name,
+        use_clip=use_clip,
+        data_source=data_source,
+        data_fname=input_fname if os.path.exists(input_fname) else None,
+        sequence_id=sequence_id,
+    )
 
     hand_name = args.hand if "hand" in args.hand else f"{args.hand}_hand"
     kwargs = prepare_cfgs(

@@ -20,6 +20,13 @@ Vectorized environment wrapper.
 """
 
 
+def _sanitize_log_dict(log_dict):
+    """Drop unsupported log entries before exposing them to rl-games episode logging."""
+    if not isinstance(log_dict, dict):
+        return log_dict
+    return {k: v for k, v in log_dict.items() if v is not None}
+
+
 class RlGamesVecEnvWrapper(IVecEnv):
     """Wraps around Isaac Lab environment for RL-Games.
 
@@ -273,6 +280,8 @@ class RlGamesVecEnvWrapper(IVecEnv):
         extras = {
             k: v.to(device=self._rl_device, non_blocking=True) if hasattr(v, "to") else v for k, v in extras.items()
         }
+        if "log" in extras:
+            extras["log"] = _sanitize_log_dict(extras["log"])
         # remap extras from "log" to "episode"
         if "log" in extras:
             extras["episode"] = extras.pop("log")
