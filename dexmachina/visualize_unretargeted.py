@@ -171,7 +171,7 @@ def main(args):
     step_indices = list(step_indices)
     print(f"Unretargeted visualization: {args.data_source}, hands={hand_sides}, frames={len(step_indices)}")
 
-    cam_pos, cam_lookat = [1.5, -1.5, 1.3], [0, -0.08, 0.95]
+    cam_pos, cam_lookat = [-1, -1, 1.3], [0, -0.08, 0.95]
     print(f"Camera pos={[round(v,3) for v in cam_pos]}, lookat={[round(v,3) for v in cam_lookat]}")
 
     gs.init(backend=gs.gpu)

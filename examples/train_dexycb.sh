@@ -5,7 +5,7 @@ HAND=orca_hand
 CLIP="20200709-subject-01/20200709_141754-0-63"
 
 EXP_NAME=dexycb_hybrid_start_stable
-python dexmachina/rl/train_rl_games.py -B 6000 -obf -obt --max_epochs 1000 --num_zero_epoch 100\
+python dexmachina/rl/train_rl_games.py -B 10000 -obf -obt --max_epochs 5000 \
     --data_source dexycb \
     --actuate_object --retarget_name para --horizon 16 -imw 0.5 --gain_mode all \
     --curr_schedule uniform --wait_epochs 100 --learning_rate 0.0003 \

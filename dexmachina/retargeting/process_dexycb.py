@@ -1,14 +1,16 @@
 """
 Process DexYCB sequences to the same .npy format as ARCTIC (world_coord + params)
 for single-hand retargeting. Output is in Genesis frame (Z-up, object centered on table).
-Uses MANO model for hand vertices/joints and YCB meshes for object vertices.
+Uses DexYCB joint_3d for hand joints by default and MANO pose for hand vertices/YCB contacts.
 """
 import os
 import argparse
 import numpy as np
 import torch
 import yaml
+import importlib.util
 from scipy.spatial.transform import Rotation as R
+from pathlib import Path
 
 from dexmachina.retargeting.contact_utils import (
     MANO_HAND_LINKS,
@@ -30,6 +32,13 @@ _MANOPTH_TO_INTERNAL_JOINT_ORDER = np.array(
     dtype=np.int64,
 )
 
+# DexYCB label joint_3d order from dex_ycb_toolkit/dex_ycb.py:
+# [wrist, thumb(1..4), index(1..4), middle(1..4), ring(1..4), little(1..4)]
+_DEXYCB_JOINT3D_TO_INTERNAL_JOINT_ORDER = np.array(
+    [0, 5, 6, 7, 9, 10, 11, 17, 18, 19, 13, 14, 15, 1, 2, 3, 4, 8, 12, 16, 20],
+    dtype=np.int64,
+)
+
 
 def _reorder_mano_joints_to_internal(joints):
     """Reorder MANO joints from manopth output convention to DexMachina internal convention."""
@@ -37,6 +46,69 @@ def _reorder_mano_joints_to_internal(joints):
     if joints.shape[0] != 21:
         raise ValueError(f"Expected 21 MANO joints, got shape {joints.shape}")
     return joints[_MANOPTH_TO_INTERNAL_JOINT_ORDER]
+
+
+def _reorder_dexycb_joint3d_to_internal(joints):
+    """Reorder DexYCB label joint_3d to DexMachina internal convention."""
+    joints = np.asarray(joints)
+    if joints.shape[0] != 21:
+        raise ValueError(f"Expected 21 DexYCB joints, got shape {joints.shape}")
+    return joints[_DEXYCB_JOINT3D_TO_INTERNAL_JOINT_ORDER]
+
+
+def resolve_mano_root(mano_root=None):
+    """Resolve a MANO model directory containing MANO_RIGHT.pkl and MANO_LEFT.pkl."""
+    candidates = []
+    if mano_root is not None:
+        candidates.append(Path(mano_root))
+    env_root = os.environ.get("MANOPTH_ROOT")
+    if env_root:
+        candidates.append(Path(env_root))
+
+    spec = importlib.util.find_spec("manopth")
+    if spec and spec.origin:
+        pkg_path = Path(spec.origin).resolve().parent
+        candidates.extend(
+            [
+                pkg_path / "mano" / "models",
+                pkg_path.parent / "mano" / "models",
+                pkg_path / "mano_v1_2" / "models",
+                pkg_path.parent / "mano_v1_2" / "models",
+            ]
+        )
+
+    candidates.append(Path("manopth") / "mano" / "models")
+
+    seen = set()
+    for candidate in candidates:
+        candidate = candidate.expanduser().resolve()
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        right_pkl = candidate / "MANO_RIGHT.pkl"
+        left_pkl = candidate / "MANO_LEFT.pkl"
+        if right_pkl.is_file() and left_pkl.is_file():
+            return str(candidate)
+
+    fallback = Path(mano_root if mano_root is not None else "manopth/mano/models").expanduser().resolve()
+    right_pkl = fallback / "MANO_RIGHT.pkl"
+    if not right_pkl.is_file():
+        raise FileNotFoundError(
+            f"MANO model not found at {right_pkl}. "
+            "Download from https://mano.is.tue.mpg.de and place MANO_LEFT.pkl, MANO_RIGHT.pkl in a folder, "
+            "then pass --mano_root /path/to/that/folder or set MANOPTH_ROOT."
+        )
+    return str(fallback)
+
+
+def reconstruct_mano_from_pose_m(pose_m, mano_betas, mano_layer, device):
+    """Reconstruct MANO verts and joints from DexYCB pose_m. Returns meters in MANO camera frame."""
+    pose_t = torch.from_numpy(pose_m).float().to(device)
+    betas = torch.from_numpy(mano_betas).float().unsqueeze(0).to(device)
+    verts, joints = mano_layer(pose_t[:, 0:48], betas, pose_t[:, 48:51])
+    verts = verts.squeeze(0).cpu().numpy() / 1000.0
+    joints = joints.squeeze(0).cpu().numpy() / 1000.0
+    return verts, joints
 
 
 def _verify_processed_npy(args):
@@ -231,6 +303,17 @@ def main():
         help="MANO model root (e.g. manopth/mano/models). Default from manopth.",
     )
     parser.add_argument(
+        "--joint_source",
+        choices=["joint_3d", "pose_m"],
+        default="joint_3d",
+        help="Which hand joint source to store in world_coord for retargeting.",
+    )
+    parser.add_argument(
+        "--compare_joint_sources",
+        action="store_true",
+        help="Compute and print joint_3d vs pose_m reconstruction agreement stats.",
+    )
+    parser.add_argument(
         "--verify",
         "-v",
         action="store_true",
@@ -299,28 +382,7 @@ def main():
     R_c = T_serial[:, :3]
     t_c = T_serial[:, 3]
 
-    mano_root = args.mano_root
-    if mano_root is None:
-        # Try env, then paths relative to common repo layouts
-        for candidate in [
-            os.environ.get("MANOPTH_ROOT"),
-            os.path.join(os.path.dirname(__file__), "..", "..", "..", "dex-ycb-toolkit", "manopth", "mano", "models"),
-            os.path.join(os.path.dirname(__file__), "..", "..", "..", "dex-ycb-toolkit", "manopth", "mano_v1_2", "models"),
-        ]:
-            if candidate and os.path.isdir(candidate):
-                right_pkl = os.path.join(candidate, "MANO_RIGHT.pkl")
-                if os.path.isfile(right_pkl):
-                    mano_root = os.path.abspath(candidate)
-                    break
-        if mano_root is None:
-            mano_root = "manopth/mano/models"  # fallback (relative to cwd)
-    right_pkl = os.path.join(mano_root, "MANO_RIGHT.pkl")
-    if not os.path.isfile(right_pkl):
-        raise FileNotFoundError(
-            f"MANO model not found at {right_pkl}. "
-            "Download from https://mano.is.tue.mpg.de and place MANO_LEFT.pkl, MANO_RIGHT.pkl in a folder, "
-            "then pass --mano_root /path/to/that/folder or set MANOPTH_ROOT."
-        )
+    mano_root = resolve_mano_root(args.mano_root)
     mano_layer = ManoLayer(
         flat_hand_mean=False,
         ncomps=45,
@@ -370,6 +432,7 @@ def main():
     shape_l = np.zeros((num_frames, 10), dtype=np.float32)
     shape_r = np.zeros((num_frames, 10), dtype=np.float32)
     pose_l_list, pose_r_list = [], []
+    joint_source_errs = []
 
     grasp_ycb_id = ycb_ids[ycb_grasp_ind]
     obj_verts_model = _load_ycb_mesh_vertices(dex_ycb_dir, grasp_ycb_id)
@@ -379,30 +442,42 @@ def main():
         label = np.load(label_path)
         pose_m = label["pose_m"]
         pose_y = label["pose_y"]
+        joint_3d = np.asarray(label["joint_3d"][0], dtype=np.float32)
+        if np.all(joint_3d == -1.0):
+            raise RuntimeError(
+                f"joint_3d is invalid for frame {frame} in sequence {args.sequence}"
+            )
 
-        # MANO: pose_m (1, 51) -> PCA 0:48, trans 48:51 (mm)
-        pose_t = torch.from_numpy(pose_m).float().to(device)
-        betas = torch.from_numpy(mano_betas).float().unsqueeze(0).to(device)
-        verts, joints = mano_layer(pose_t[:, 0:48], betas, pose_t[:, 48:51])
-        verts = verts.squeeze(0).cpu().numpy() / 1000.0
-        joints = joints.squeeze(0).cpu().numpy() / 1000.0
+        # MANO: pose_m (1, 51) -> PCA 0:48, trans 48:51 (mm). We keep this path for hand vertices.
+        verts, joints_pose_m = reconstruct_mano_from_pose_m(pose_m, mano_betas, mano_layer, device)
         verts_world = _transform_pts_cam_to_world(verts, R_c, t_c)
-        joints_world = _transform_pts_cam_to_world(joints, R_c, t_c)
-        joints_world = _reorder_mano_joints_to_internal(joints_world)
+        joints_world_pose_m = _transform_pts_cam_to_world(joints_pose_m, R_c, t_c)
+        joints_world_pose_m = _reorder_mano_joints_to_internal(joints_world_pose_m)
+        joints_world_joint3d = _transform_pts_cam_to_world(joint_3d, R_c, t_c)
+        joints_world_joint3d = _reorder_dexycb_joint3d_to_internal(joints_world_joint3d)
+
+        if args.compare_joint_sources:
+            joint_source_errs.append(
+                np.linalg.norm(joints_world_joint3d - joints_world_pose_m, axis=-1)
+            )
+
+        joints_world = (
+            joints_world_joint3d if args.joint_source == "joint_3d" else joints_world_pose_m
+        )
 
         if mano_side == "left":
             joints_left[out_idx] = joints_world
-            trans_l_list.append(pose_t[0, 48:51].cpu().numpy() / 1000.0)
+            trans_l_list.append(np.asarray(pose_m[0, 48:51], dtype=np.float32) / 1000.0)
             rot_l_list.append(np.zeros(3, dtype=np.float32))
-            pose_l_list.append(pose_t[0, 0:48].cpu().numpy())
+            pose_l_list.append(np.asarray(pose_m[0, 0:48], dtype=np.float32))
             trans_r_list.append(np.zeros(3, dtype=np.float32))
             rot_r_list.append(np.zeros(3, dtype=np.float32))
             pose_r_list.append(np.zeros(48, dtype=np.float32))
         else:
             joints_right[out_idx] = joints_world
-            trans_r_list.append(pose_t[0, 48:51].cpu().numpy() / 1000.0)
+            trans_r_list.append(np.asarray(pose_m[0, 48:51], dtype=np.float32) / 1000.0)
             rot_r_list.append(np.zeros(3, dtype=np.float32))
-            pose_r_list.append(pose_t[0, 0:48].cpu().numpy())
+            pose_r_list.append(np.asarray(pose_m[0, 0:48], dtype=np.float32))
             trans_l_list.append(np.zeros(3, dtype=np.float32))
             rot_l_list.append(np.zeros(3, dtype=np.float32))
             pose_l_list.append(np.zeros(48, dtype=np.float32))
@@ -452,6 +527,17 @@ def main():
     R_tag, t_tag = T_apriltag[:, :3], T_apriltag[:, 3]
     obj_trans = np.stack(obj_trans_list, axis=0)
     obj_quat = np.stack(obj_quat_list, axis=0)
+    if joint_source_errs:
+        joint_source_errs = np.stack(joint_source_errs, axis=0)
+        joint_source_mean_err = float(np.mean(joint_source_errs))
+        joint_source_max_err = float(np.max(joint_source_errs))
+        print(
+            f"[INFO] joint_3d vs pose_m joint agreement in world frame: "
+            f"mean={joint_source_mean_err:.6f} m, max={joint_source_max_err:.6f} m"
+        )
+    else:
+        joint_source_mean_err = None
+        joint_source_max_err = None
     dexycb_world_to_genesis(
         obj_trans,
         obj_quat,
@@ -480,6 +566,7 @@ def main():
         },
         "params": {
             "frame": "genesis",
+            "joint_source": args.joint_source,
             "ycb_class_name": _YCB_CLASSES[grasp_ycb_id],
             "obj_trans": obj_trans,
             "obj_rot": obj_rot,
@@ -495,6 +582,14 @@ def main():
             "pose_r": np.stack(pose_r_list, axis=0),
             "cam_R_world": R_c,
             "cam_t_world": t_c,
+            **(
+                {
+                    "joint_source_compare_mean_err_m": np.array(joint_source_mean_err, dtype=np.float32),
+                    "joint_source_compare_max_err_m": np.array(joint_source_max_err, dtype=np.float32),
+                }
+                if joint_source_mean_err is not None
+                else {}
+            ),
         },
     }
 

@@ -9,7 +9,8 @@ cd "$SCRIPT_DIR"
 HAND=orca_hand
 # HAND=inspire_hand
 SUBJECT=20200709-subject-01
-SEQUENCE_ID=20200709_142211
+# SEQUENCE_ID=20200709_142211
+SEQUENCE_ID=20200709_141754
 CLIP="${SUBJECT}/${SEQUENCE_ID}-0-72"
 
 ## If the .npy file is not already processed, run the following:
