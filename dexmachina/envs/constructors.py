@@ -38,6 +38,7 @@ def get_all_env_cfg(args, device, load_retarget_data=True):
     reward_cfg['thumb_weight'] = args.thumb_weight
     reward_cfg['use_retarget_contact'] = args.use_retarget_contact 
     reward_cfg['retarget_objframe'] = not args.retarget_worldfr
+    reward_cfg['contact_align_kappa'] = args.contact_align_kappa
     reward_cfg['action_penalty'] = args.action_penalty
 
     if args.objdex_baseline:
@@ -331,6 +332,14 @@ def get_common_argparser():
     parser.add_argument('--contact_rew_function', '-crf', type=str, default='exp', choices=['exp', 'sigmoid'])
     parser.add_argument('--use_retarget_contact', '-urc', action='store_true')
     parser.add_argument('--retarget_worldfr', '-rwf', action='store_true')
+    parser.add_argument(
+        '--contact_align_kappa',
+        '-cak',
+        type=float,
+        default=0.0,
+        help='Matched contact only: multiply per-link contact reward by exp(kappa*(dot-1)) using outward demo normal vs '
+        '(policy-demo) direction in world; 0 disables. Requires --use_retarget_contact and demo normals.',
+    )
 
     parser.add_argument('--kp', '-kp', type=float, default=200.0)
     parser.add_argument('--kv', '-kv', type=float, default=20.0)

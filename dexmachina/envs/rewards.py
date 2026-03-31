@@ -3,6 +3,7 @@ import torch
 import numpy as np
 from os.path import join
 from dexmachina.envs.reward_utils import position_distance, rotation_distance, chamfer_distance, transform_contact
+from dexmachina.envs.math_utils import matrix_from_quat
 
 
 def get_reward_cfg(last_n_frame=-1):
@@ -47,6 +48,9 @@ def get_reward_cfg(last_n_frame=-1):
         "objdex_baseline": False,
         "use_retarget_contact": False,
         "retarget_objframe": True, # if True, the contact is in the object frame, otherwise in the wrist frame
+        # Matched retarget contact only: scale per-link reward by exp(kappa * (dot - 1)), dot = clamp((policy-demo)_hat · n_hat, 0, 1)
+        # in world frame; 0 disables. Same convention as virtual-force normals (outward object normal).
+        "contact_align_kappa": 0.0,
 
     } 
     return reward_cfg
@@ -100,7 +104,22 @@ class RewardModule:
         self.thumb_weight = reward_cfg.get("thumb_weight", 1.0)
         if self.thumb_weight != 1.0:
             print(f"Using thumb weight: {self.thumb_weight}x")
-        self.load_demo(demo_data, retarget_data, device) 
+        self.contact_align_kappa = float(reward_cfg.get("contact_align_kappa", 0.0))
+        self._contact_align_enabled = False
+        self.load_demo(demo_data, retarget_data, device)
+        if self.contact_align_kappa > 0.0:
+            if not self.use_retarget_contact:
+                print("contact_align_kappa > 0 but use_retarget_contact is False; disabling contact normal alignment.")
+            elif not all(
+                f"contact_normals_local_{s}" in self.demo_tensors for s in ("left", "right")
+            ):
+                print(
+                    "contact_align_kappa > 0 but demo lacks contact_normals_local_{left,right}; "
+                    "disabling contact normal alignment."
+                )
+            else:
+                self._contact_align_enabled = True
+                print(f"Contact reward normal alignment enabled (kappa={self.contact_align_kappa})")
 
     def load_demo(self, demo_data, retarget_data, device):
         self.demo_tensors = dict()
@@ -429,6 +448,11 @@ class RewardModule:
         assert demo_contacts.shape[1] == contact_link_pos.shape[1], f"Shape mismatch: {demo_contacts.shape} vs {contact_link_pos.shape}"
         assert demo_contacts.shape[2] == contact_link_pos.shape[2], f"Shape mismatch: {contact_link_pos.shape} vs {demo_contacts.shape}"
         demo_valids = demo_contacts[:, :, :, -1] > 0.0 # (part id is <= 0 if no contact)
+        v = contact_link_valid
+        if v.dtype != torch.bool:
+            v = v > 0
+        if v.dim() == 4 and v.shape[-1] == 1:
+            v = v.squeeze(-1)
          
         # need to reshape this to (N, num_obj_links * num_hand_links, 3) to do the transformation first
         if self.retarget_objframe:
@@ -450,9 +474,9 @@ class RewardModule:
             policy_pos = contact_link_pos[:, :, :, :3]
         
         
-        both_invalid_mask = torch.logical_not(demo_valids) & torch.logical_not(contact_link_valid)
+        both_invalid_mask = torch.logical_not(demo_valids) & torch.logical_not(v)
         # only one valid 
-        one_valid_mask = torch.logical_xor(demo_valids, contact_link_valid)
+        one_valid_mask = torch.logical_xor(demo_valids, v)
         # compute distance between demo and policy contact points
         dist = position_distance(demo_pos, policy_pos)
         if self.mask_zero_contact:
@@ -468,7 +492,29 @@ class RewardModule:
         # if take mean, encourages all contacts to be close to the targets 
         # if take min, encourages only one contact to be close to the target
         # part_dist = torch.mean(dist, dim=-1) # (N, num_obj_links=2)  
-        return dist 
+
+        if not self._contact_align_enabled:
+            return dist, torch.ones_like(dist)
+
+        demo_xyz = demo_contacts[:, :, :, :3]
+        policy_xyz = contact_link_pos[:, :, :, :3]
+        diff = policy_xyz - demo_xyz
+        demo_normals = self.match_demo_state(f"contact_normals_local_{side}", episode_length_buf)
+        demo_normals = demo_normals.clone()[:, [1, 0], :, :]
+        R = matrix_from_quat(demo_obj_pose[:, 3:7])
+        # Same as normals_local_to_world_torch: n_w = n @ R.T; avoid (B,2,L,3)@(B,3,3) matmul
+        # (PyTorch would treat ... x (L,3) as matrix batch and break).
+        n_w = torch.einsum("bpni,bki->bpnk", demo_normals, R)
+        d_hat = torch.nn.functional.normalize(diff, dim=-1, eps=1e-8)
+        n_hat = torch.nn.functional.normalize(n_w, dim=-1, eps=1e-8)
+        dot = (d_hat * n_hat).sum(dim=-1).clamp(min=0.0, max=1.0)
+        align_w = torch.exp(self.contact_align_kappa * (dot - 1.0))
+
+        pair_ok = ~(both_invalid_mask | one_valid_mask)
+        diff_norm = torch.norm(diff, dim=-1)
+        use_align = pair_ok & (diff_norm >= 1e-5)
+        align_w = torch.where(use_align, align_w, torch.ones_like(align_w))
+        return dist, align_w
     
     def compute_matched_contact_reward(
         self,
@@ -487,7 +533,7 @@ class RewardModule:
             [contacts_link_left, contacts_link_right],
             [contacts_link_valid_left, contacts_link_valid_right]
         ):
-            part_dist = self.compute_matched_contact_per_hand(
+            part_dist, part_align = self.compute_matched_contact_per_hand(
                 contacts, valids, episode_length_buf, 
                 obj_pose, demo_obj_pose, side=side
             )
@@ -496,8 +542,11 @@ class RewardModule:
             
             for i, part in enumerate(['bottom', 'top']): 
                 con_dist = part_dist[:, i]  # shape (N, num_links)
+                a_w = part_align[:, i]
+                rews[f"contact_align_{side}_{part}"] = a_w.mean(dim=-1)
                 if self.exp_kpt_first:
                     per_link_rew = self.contact_dist_to_rew(con_dist, self.contact_rew_function)  # (N, num_links)
+                    per_link_rew = per_link_rew * a_w
                     # Use weighted mean if weights are available
                     if link_weights is not None:
                         # Weighted mean: sum(w * x) / sum(w)
@@ -515,9 +564,12 @@ class RewardModule:
                     # For non-exp_kpt_first, apply weights to distances before mean
                     if link_weights is not None:
                         weighted_dist = (con_dist * link_weights).sum(dim=-1) / link_weights.sum()
-                        con_rew = self.contact_dist_to_rew(weighted_dist, self.contact_rew_function)
+                        weighted_align = (a_w * link_weights).sum(dim=-1) / link_weights.sum()
+                        con_rew = self.contact_dist_to_rew(weighted_dist, self.contact_rew_function) * weighted_align
                     else:
-                        con_rew = self.contact_dist_to_rew(con_dist.mean(dim=-1), self.contact_rew_function) 
+                        con_dist_mean = con_dist.mean(dim=-1)
+                        a_mean = a_w.mean(dim=-1)
+                        con_rew = self.contact_dist_to_rew(con_dist_mean, self.contact_rew_function) * a_mean
                 rews[f"conrew_{side}_{part}"] = con_rew
                 rews[f"matched_condist_{side}_{part}"] = con_dist
                 contact_rew += con_rew
