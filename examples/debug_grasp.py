@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 import random
+import os
 from dexmachina.envs.base_env import BaseEnv, get_env_cfg
 from dexmachina.envs.robot import get_default_robot_cfg
 from dexmachina.envs.demo_data import load_genesis_retarget_data, load_contact_retarget_data
@@ -139,6 +140,55 @@ def write_video(frames_out, output_path, fps):
     clip.write_videofile(output_path)
     print(f"saved video to {output_path}")
 
+
+def _collect_step_state(env, frame_idx, step_idx, apply_opt):
+    state = {
+        "frame_idx": int(frame_idx),
+        "step_idx": int(step_idx),
+        "apply_opt": bool(apply_opt),
+        "episode_start": int(env.episode_start_buf[0].item()),
+        "episode_length": int(env.episode_length_buf[0].item()),
+    }
+    for side, robot in env.robots.items():
+        state[f"{side}_dof_pos"] = robot.dof_pos[0].detach().cpu().clone()
+        state[f"{side}_dof_vel"] = robot.dof_vel[0].detach().cpu().clone()
+        state[f"{side}_wrist_pose"] = robot.wrist_pose[0].detach().cpu().clone()
+        state[f"{side}_kpt_pos"] = robot.kpt_pos[0].detach().cpu().clone()
+    if env.object is not None:
+        state["object_root_pos"] = env.object.root_pos[0].detach().cpu().clone()
+        state["object_root_quat"] = env.object.root_quat[0].detach().cpu().clone()
+        state["object_root_lin_vel"] = env.object.root_lin_vel[0].detach().cpu().clone()
+        state["object_root_ang_vel"] = env.object.root_ang_vel[0].detach().cpu().clone()
+        state["object_dof_pos"] = env.object.dof_pos[0].detach().cpu().clone()
+        state["object_dof_vel"] = env.object.dof_vel[0].detach().cpu().clone()
+        state["object_part_pos"] = env.object.part_pos[0].detach().cpu().clone()
+        state["object_part_quat"] = env.object.part_quat[0].detach().cpu().clone()
+    return state
+
+
+def _stack_state_records(records):
+    stacked = {}
+    for key in records[0]:
+        values = [record[key] for record in records]
+        first = values[0]
+        if torch.is_tensor(first):
+            stacked[key] = torch.stack(values, dim=0)
+        else:
+            stacked[key] = torch.tensor(values)
+    return stacked
+
+
+def _save_state_records(records, tag):
+    if len(records) == 0:
+        return
+    stacked = _stack_state_records(records)
+    pt_path = f"/tmp/{tag}_states.pt"
+    npz_path = f"/tmp/{tag}_states.npz"
+    torch.save(stacked, pt_path)
+    np.savez(npz_path, **{k: v.cpu().numpy() for k, v in stacked.items()})
+    print(f"{tag}: saved state dump to {pt_path}")
+    print(f"{tag}: saved state dump to {npz_path}")
+
 def _quat_angle_error_rad(q_a, q_b):
     q_a = q_a / torch.clamp(torch.norm(q_a), min=1e-8)
     q_b = q_b / torch.clamp(torch.norm(q_b), min=1e-8)
@@ -182,19 +232,24 @@ def debug_object_state_vs_demo(env, req_frame_idx, stage):
         )
 
 def force_reset_to_frame(env, frame_idx, apply_opt=True, allow_fallback=False):
+    local_frame_idx = int(frame_idx)
+    if env.object is not None and int(env.object.num_demo_frames) > 0:
+        if local_frame_idx >= int(env.object.num_demo_frames):
+            local_frame_idx = int(frame_idx) - FRAME_START
+        local_frame_idx = int(np.clip(local_frame_idx, 0, int(env.object.num_demo_frames) - 1))
     saved_rand_ratio = env.rand_init_ratio
     env.rand_init_ratio = 0.0
     env.reset_idx([0])
     env.rand_init_ratio = saved_rand_ratio
-    env.episode_start_buf[0] = int(frame_idx)
-    env.episode_length_buf[0] = int(frame_idx)
+    env.episode_start_buf[0] = local_frame_idx
+    env.episode_length_buf[0] = local_frame_idx
     episode_start = env.episode_start_buf[0:1]
     for _, robot in env.robots.items():
         robot.reset_idx(env_idxs=[0], episode_start=episode_start)
     for _, obj in env.objects.items():
         obj.reset_idx(env_idxs=[0], episode_start=episode_start)
     if DEBUG_OBJECT_STATE_MATCH:
-        debug_object_state_vs_demo(env, frame_idx, stage="after_reset_before_opt")
+        debug_object_state_vs_demo(env, local_frame_idx, stage="after_reset_before_opt")
     if apply_opt and env.enforce_valid_rand_init_grasp:
         saved_fallback = env.valid_grasp_fallback_to_zero
         if not allow_fallback:
@@ -202,7 +257,7 @@ def force_reset_to_frame(env, frame_idx, apply_opt=True, allow_fallback=False):
         env._ensure_valid_rand_init_grasp([0], [True])
         env.valid_grasp_fallback_to_zero = saved_fallback
         if DEBUG_OBJECT_STATE_MATCH:
-            debug_object_state_vs_demo(env, frame_idx, stage="after_optimize")
+            debug_object_state_vs_demo(env, local_frame_idx, stage="after_optimize")
 
 def snapshot_hold_cycles(env, tag, frames, steps_per_cycle=120, seed=0, apply_opt=True):
     torch.manual_seed(seed)
@@ -210,6 +265,7 @@ def snapshot_hold_cycles(env, tag, frames, steps_per_cycle=120, seed=0, apply_op
     random.seed(seed)
     env.max_video_frames = max(env.max_video_frames, len(frames) * steps_per_cycle * 2)
     env.start_recording()
+    state_records = []
     viewer = getattr(env.scene, "viewer", None)
     if viewer is not None and getattr(viewer, "camera", None) is not None:
         viewer.camera.follow(env.robots["left"].entity)
@@ -223,7 +279,8 @@ def snapshot_hold_cycles(env, tag, frames, steps_per_cycle=120, seed=0, apply_op
         }
         qpos_mean = float(torch.mean(torch.cat([v for v in hold_targets.values()])).item())
         print(f"[hold] frame={frame_idx} ep_start={int(env.episode_start_buf[0].item())} qpos_mean={qpos_mean:.4f}")
-        for _ in range(steps_per_cycle):
+        state_records.append(_collect_step_state(env, frame_idx, step_idx=-1, apply_opt=apply_opt))
+        for step_idx in range(steps_per_cycle):
             for name, robot in env.robots.items():
                 robot.control_joint_position(hold_targets[name][None], env_idxs=[0])
             for _, obj in env.objects.items():
@@ -233,6 +290,7 @@ def snapshot_hold_cycles(env, tag, frames, steps_per_cycle=120, seed=0, apply_op
             env._compute_intermediate_values()
             env.reset_terminated[:], env.reset_time_outs[:] = env._get_dones()
             env.reset_buf[:] = env.reset_terminated | env.reset_time_outs
+            state_records.append(_collect_step_state(env, frame_idx, step_idx=step_idx, apply_opt=apply_opt))
             if env.record_video:
                 env._render_headless()
 
@@ -241,6 +299,7 @@ def snapshot_hold_cycles(env, tag, frames, steps_per_cycle=120, seed=0, apply_op
         output_path = f"/tmp/{tag}_hold.mp4"
         write_video(frames_out, output_path, fps=int(1 / env.dt))
         print(f"{tag}: saved video to {output_path}")
+    _save_state_records(state_records, tag)
 
 def visualize_close_annealing(env, frame_idx, steps=50, seed=0, tag="anneal_close", probe_hold_steps=8):
     torch.manual_seed(seed)

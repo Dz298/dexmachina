@@ -1,6 +1,7 @@
 import os
-import torch
+
 import numpy as np
+import torch
 
 from graspqp.hands import get_hand_model
 from graspqp.core.optimizer import MalaStar
@@ -73,6 +74,144 @@ class GraspQPOptimizer:
         self.object_model = None
         self.initialized = False
 
+    def _infer_contact_count(self) -> int:
+        # Match fit.py's default contact budget while remaining safe for simpler hands.
+        return min(12, self.hand_model.n_contact_candidates)
+
+    def _get_contact_groups(self):
+        groups = []
+        prefixes = ("index", "middle", "ring", "thumb")
+        for prefix in prefixes:
+            link_indices = [
+                link_idx
+                for link_name, link_idx in self.hand_model.link_name_to_link_index.items()
+                if link_name.startswith(prefix)
+            ]
+            if link_indices:
+                groups.append(
+                    torch.tensor(link_indices, dtype=torch.long, device=self.device)
+                )
+        return groups
+
+    def _make_zero_force_closure_metric(self):
+        def _zero_metric(contact_pts, *args, **kwargs):
+            zeros = torch.zeros(contact_pts.shape[0], dtype=contact_pts.dtype, device=contact_pts.device)
+            return zeros, None
+
+        return _zero_metric
+
+    def _calculate_losses(self, weight_dict, energy_fnc, energy_kwargs):
+        try:
+            losses = calculate_energy(
+                self.hand_model,
+                self.object_model,
+                energy_names=list(weight_dict.keys()),
+                energy_fnc=energy_fnc,
+                **energy_kwargs,
+            )
+            return losses, energy_fnc
+        except RuntimeError as exc:
+            msg = str(exc)
+            if weight_dict.get("E_fc", 0.0) <= 0.0 or ("Q is not SPD" not in msg and "positive-definite" not in msg):
+                raise
+            print("GraspQPOptimizer: force-closure solve was ill-conditioned; disabling E_fc for this optimization run.")
+            weight_dict["E_fc"] = 0.0
+            zero_metric = self._make_zero_force_closure_metric()
+            losses = calculate_energy(
+                self.hand_model,
+                self.object_model,
+                energy_names=list(weight_dict.keys()),
+                energy_fnc=zero_metric,
+                **energy_kwargs,
+            )
+            return losses, zero_metric
+
+    def _select_initial_contact_indices(self, hand_pose: torch.Tensor) -> torch.Tensor:
+        all_indices = (
+            torch.arange(self.hand_model.n_contact_candidates, dtype=torch.long, device=self.device)
+            .unsqueeze(0)
+            .expand(hand_pose.shape[0], -1)
+        )
+        self.hand_model.set_parameters(hand_pose, contact_point_indices=all_indices)
+        distance, _ = self.object_model.cal_distance(self.hand_model.contact_points)
+        n_contact = self._infer_contact_count()
+        contact_groups = self._get_contact_groups()
+        if not contact_groups:
+            return distance.abs().topk(k=n_contact, largest=False).indices
+
+        link_indices = self.hand_model.global_index_to_link_index
+        selected = []
+        n_groups = len(contact_groups)
+        for env_idx in range(hand_pose.shape[0]):
+            chosen = []
+            chosen_mask = torch.zeros(self.hand_model.n_contact_candidates, dtype=torch.bool, device=self.device)
+            remaining = n_contact
+            for group_idx, group_links in enumerate(contact_groups):
+                target = remaining // max(1, (n_groups - group_idx))
+                if target == 0:
+                    continue
+                group_mask = (link_indices.unsqueeze(1) == group_links.unsqueeze(0)).any(dim=1)
+                candidate_ids = torch.nonzero(group_mask, as_tuple=False).squeeze(-1)
+                if candidate_ids.numel() == 0:
+                    continue
+                k = min(target, candidate_ids.numel())
+                best_local = distance[env_idx, candidate_ids].abs().topk(k=k, largest=False).indices
+                best_ids = candidate_ids[best_local]
+                chosen.append(best_ids)
+                chosen_mask[best_ids] = True
+                remaining -= k
+
+            if remaining > 0:
+                candidate_ids = torch.nonzero(~chosen_mask, as_tuple=False).squeeze(-1)
+                filler_local = distance[env_idx, candidate_ids].abs().topk(k=remaining, largest=False).indices
+                chosen.append(candidate_ids[filler_local])
+
+            selected.append(torch.cat(chosen, dim=0)[:n_contact])
+
+        return torch.stack(selected, dim=0)
+
+    def _get_robot_wrist_pose(self, robot, idx_tensor: torch.Tensor):
+        if hasattr(robot, "wrist_pose"):
+            wrist_pose = robot.wrist_pose[idx_tensor]
+            return wrist_pose[:, :3], wrist_pose[:, 3:]
+        return robot.entity.get_pos()[idx_tensor], robot.entity.get_quat()[idx_tensor]
+
+    def _get_finger_joint_positions(self, robot):
+        robot_dof_names = robot.actuated_dof_names
+        name_to_pos = {name: idx for idx, name in enumerate(robot_dof_names)}
+        gqp_dof_names = self.hand_model._actuated_joints_names
+
+        if all(name in name_to_pos for name in gqp_dof_names):
+            return [name_to_pos[name] for name in gqp_dof_names]
+
+        if "allegro" in self.hand_name.lower():
+            allegro_name_map = {
+                "index_joint_0": "joint_0.0",
+                "index_joint_1": "joint_1.0",
+                "index_joint_2": "joint_2.0",
+                "index_joint_3": "joint_3.0",
+                "middle_joint_0": "joint_4.0",
+                "middle_joint_1": "joint_5.0",
+                "middle_joint_2": "joint_6.0",
+                "middle_joint_3": "joint_7.0",
+                "ring_joint_0": "joint_8.0",
+                "ring_joint_1": "joint_9.0",
+                "ring_joint_2": "joint_10.0",
+                "ring_joint_3": "joint_11.0",
+                "thumb_joint_0": "joint_12.0",
+                "thumb_joint_1": "joint_13.0",
+                "thumb_joint_2": "joint_14.0",
+                "thumb_joint_3": "joint_15.0",
+            }
+            if all(allegro_name_map[name] in name_to_pos for name in gqp_dof_names):
+                return [name_to_pos[allegro_name_map[name]] for name in gqp_dof_names]
+
+        raise ValueError(
+            "GraspQPOptimizer: joint name mismatch between graspqp and dexmachina.\n"
+            f"  graspqp joints : {gqp_dof_names}\n"
+            f"  dexmachina joints: {robot_dof_names}"
+        )
+
     def initialize(self, batch_size):
         from graspqp.hands import AVAILABLE_HANDS
         gn = self.hand_name
@@ -97,47 +236,41 @@ class GraspQPOptimizer:
         )
         self.initialized = True
 
-    def optimize_grasps(self, robot, env_idxs, iters=50, w_pen=100.0, w_spen=10.0, w_joints=1.0, w_anchor=10.0):
+    def optimize_grasps(
+        self,
+        robot,
+        env_idxs,
+        iters=50,
+        w_dis=100.0,
+        w_fc=1.0,
+        w_pen=100.0,
+        w_spen=10.0,
+        w_joints=1.0,
+        w_anchor=10.0,
+        friction=0.2,
+        max_lambda_limit=20.0,
+        n_friction_cone=4,
+        svd_gain=0.1,
+        use_gendexgrasp=True,
+    ):
         if not self.initialized or self.object_model.batch_size_each != len(env_idxs):
             self.initialize(len(env_idxs))
             
         B = len(env_idxs)
         idx_tensor = torch.tensor(env_idxs, dtype=torch.long, device=self.device)
 
-        n_robot_dofs = len(robot.actuated_dof_idxs)
+        dex_to_gqp = torch.tensor(self._get_finger_joint_positions(robot), dtype=torch.long, device=self.device)
+        n_robot_dofs = len(dex_to_gqp)
         if self.hand_model.n_dofs != n_robot_dofs:
+            robot_name = getattr(robot, "name", getattr(robot.entity, "name", "<unnamed>"))
             raise ValueError(
                 f"GraspQPOptimizer: hand '{self.hand_name}' has {self.hand_model.n_dofs} DOFs in graspqp "
-                f"but robot '{robot.entity.name}' has {n_robot_dofs} actuated DOFs in dexmachina. "
+                f"but robot '{robot_name}' has {n_robot_dofs} finger DOFs usable by graspqp. "
                 f"graspqp joints: {self.hand_model._actuated_joints_names}"
             )
 
-        # GraspQP (pytorch_kinematics) and Genesis may traverse the URDF in different
-        # orders, producing different DOF orderings.  Build a permutation by matching
-        # joint names so we can reorder before feeding into GraspQP and reorder back
-        # before writing results into Genesis.
-        #
-        # dex_to_gqp[gqp_i] = dex_j  means graspqp slot gqp_i = dexmachina slot dex_j
-        # gqp_to_dex[dex_j] = gqp_i  (inverse permutation, for writing back)
-        robot_dof_names = robot.actuated_dof_names
-        gqp_dof_names = self.hand_model._actuated_joints_names
-        try:
-            dex_to_gqp = torch.tensor(
-                [robot_dof_names.index(name) for name in gqp_dof_names],
-                dtype=torch.long, device=self.device,
-            )
-        except ValueError as e:
-            raise ValueError(
-                f"GraspQPOptimizer: joint name mismatch between graspqp and dexmachina.\n"
-                f"  graspqp joints : {gqp_dof_names}\n"
-                f"  dexmachina joints: {robot_dof_names}"
-            ) from e
-        gqp_to_dex = torch.zeros_like(dex_to_gqp)
-        gqp_to_dex[dex_to_gqp] = torch.arange(n_robot_dofs, device=self.device)
-
         # Get world poses
-        hand_root_pos = robot.entity.get_pos()[idx_tensor]
-        hand_root_quat = robot.entity.get_quat()[idx_tensor]
+        hand_root_pos, hand_root_quat = self._get_robot_wrist_pose(robot, idx_tensor)
         # Reorder dexmachina DOFs → graspqp DOF order
         hand_qpos = robot.dof_pos[idx_tensor][:, dex_to_gqp]
         
@@ -167,7 +300,8 @@ class GraspQPOptimizer:
         hand_pose.requires_grad_(True)
         anchor_hand_pose = hand_pose.clone().detach()
         
-        self.hand_model.set_parameters(hand_pose, contact_point_indices="all")
+        contact_point_indices = self._select_initial_contact_indices(hand_pose)
+        self.hand_model.set_parameters(hand_pose, contact_point_indices=contact_point_indices)
 
         optim_config = {
             "switch_possibility": 0.5,
@@ -184,20 +318,27 @@ class GraspQPOptimizer:
         optimizer = MalaStar(self.hand_model, **optim_config)
         
         weight_dict = {
+            "E_dis": w_dis,
+            "E_fc": w_fc,
             "E_pen": w_pen,
             "E_spen": w_spen,
             "E_joints": w_joints,
         }
-        energy_names = list(weight_dict.keys())
-        energy_fnc = GraspSpanMetricFactory.create(GraspSpanMetricFactory.MetricType.GRASPQP)
+        energy_names = [name for name, weight in weight_dict.items() if weight > 0.0]
+        energy_fnc = GraspSpanMetricFactory.create(
+            GraspSpanMetricFactory.MetricType.GRASPQP,
+            solver_kwargs={
+                "friction": friction,
+                "max_limit": max_lambda_limit,
+                "n_cone_vecs": n_friction_cone,
+            },
+        )
+        energy_kwargs = {"svd_gain": svd_gain}
+        if use_gendexgrasp:
+            energy_kwargs["method"] = "gendexgrasp"
         
         # Initial energy
-        losses = calculate_energy(
-            self.hand_model,
-            self.object_model,
-            energy_names=energy_names,
-            energy_fnc=energy_fnc,
-        )
+        losses, energy_fnc = self._calculate_losses(weight_dict, energy_fnc, energy_kwargs)
         
         energy = sum(weight_dict[k] * losses[k] for k in energy_names)
         energy += w_anchor * torch.norm(self.hand_model.hand_pose - anchor_hand_pose, dim=1)
@@ -210,12 +351,7 @@ class GraspQPOptimizer:
             reset_mask = None
             optimizer.zero_grad()
 
-            new_energies = calculate_energy(
-                self.hand_model,
-                self.object_model,
-                energy_names=energy_names,
-                energy_fnc=energy_fnc,
-            )
+            new_energies, energy_fnc = self._calculate_losses(weight_dict, energy_fnc, energy_kwargs)
 
             new_energy = sum(weight_dict[k] * new_energies[k] for k in energy_names)
             new_energy += w_anchor * torch.norm(self.hand_model.hand_pose - anchor_hand_pose, dim=1)
@@ -232,7 +368,10 @@ class GraspQPOptimizer:
                 energy[accept] = new_energy[accept]
         
         # After optimization, extract world pose
-        final_pose = self.hand_model.hand_pose.detach()
+        final_pose = self.hand_model.hand_pose.detach().clone()
+        invalid_pose = ~torch.isfinite(final_pose).all(dim=1)
+        if invalid_pose.any():
+            final_pose[invalid_pose] = anchor_hand_pose[invalid_pose]
         o_t_h_final = final_pose[:, :3]
         ortho6d_final = final_pose[:, 3:9]
         hand_qpos_final = final_pose[:, 9:]
@@ -245,8 +384,14 @@ class GraspQPOptimizer:
 
         # roma returns (x,y,z,w); Genesis set_quat expects (w,x,y,z) — convert back
         hand_root_quat_final = _xyzw_to_wxyz(roma.rotmat_to_unitquat(w_R_h_final))
+        invalid_quat = ~torch.isfinite(hand_root_quat_final).all(dim=1)
+        if invalid_quat.any():
+            hand_root_quat_final[invalid_quat] = hand_root_quat[invalid_quat]
+            w_t_h_final[invalid_quat] = hand_root_pos[invalid_quat]
+            hand_qpos_final[invalid_quat] = hand_qpos[invalid_quat]
 
         # Reorder graspqp DOF order → dexmachina DOF order before returning
-        hand_qpos_final = hand_qpos_final[:, gqp_to_dex]
+        full_qpos_final = robot.dof_pos[idx_tensor].clone()
+        full_qpos_final[:, dex_to_gqp] = hand_qpos_final
 
-        return w_t_h_final, hand_root_quat_final, hand_qpos_final
+        return w_t_h_final, hand_root_quat_final, full_qpos_final
