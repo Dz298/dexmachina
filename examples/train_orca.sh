@@ -5,7 +5,7 @@ HAND=orca_hand
 CLIP=ketchup-30-130
 
 # Full run with thumb weighting (5000 epochs) + latent world model
-EXP_NAME=hybrid_start_stable_gravity_comp
+EXP_NAME=true_hybrid_start_stable_gravity_comp_stiffer_hand_gains
 python dexmachina/rl/train_rl_games.py -B 6000 -obf -obt --max_epochs 5000 \
     --actuate_object --retarget_name para --horizon 16 -imw 0.5 --gain_mode all \
     --curr_schedule uniform --wait_epochs 100 --learning_rate 0.0003 \
@@ -14,6 +14,7 @@ python dexmachina/rl/train_rl_games.py -B 6000 -obf -obt --max_epochs 5000 \
     --action_penalty 0.01 --dialback_ep_len 80 --skip_grad --deque_len 30 \
     --task_rew_betas 10 1 5 --use_retarget_contact \
     --aux_reset_thres 0 0 0 --curr_rew_thres 0.5 0.01 0.01 0.01 \
+    -am hybrid \
     -ert 0.4 --contact_beta 10 \
     --hybrid_scales 0.1 1.0 --kp_init 80 --kv_init 5 \
     --thumb_weight 4.0 \

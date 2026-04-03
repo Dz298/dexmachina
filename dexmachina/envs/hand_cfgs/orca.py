@@ -71,21 +71,23 @@ ORCA_RIGHT_DEFAULT_QPOS = [
     -0.50477,  # right_thumb_dip (MJCF ref=-0.50477)
 ]
 
-finger_kp = 10.0  # Tuned from replay gain sweep (coarse mode optimal)
-finger_kv = 1.58   # kv ≈ sqrt(kp)/2 for critical damping
-wrist_rot_kp = 100.0  # Tuned for stable wrist control
-wrist_rot_kv = 5.0    # Matched to kp for damping
-wrist_trans_kp = 100.0  # Conservative to prevent object drops
-wrist_trans_kv = 5.0   # Damping for translation
-force_range = 100.0  # Increased from 50 to allow stronger forces
-
-# finger_kp = 80.0  # Tuned from replay gain sweep (coarse mode optimal)
-# finger_kv = finger_kp ** 0.5 / 2  # kv ≈ sqrt(kp)/2 for critical damping
-# wrist_rot_kp = 300.0  # Tuned for stable wrist control
-# wrist_rot_kv = wrist_rot_kp ** 0.5 / 2    # Matched to kp for damping
-# wrist_trans_kp = 300.0  # Conservative to prevent object drops
-# wrist_trans_kv = wrist_trans_kp ** 0.5 / 2   # Damping for translation
+## Less stiff gains for residual mode
+# finger_kp = 10.0  # Tuned from replay gain sweep (coarse mode optimal)
+# finger_kv = 1.58   # kv ≈ sqrt(kp)/2 for critical damping
+# wrist_rot_kp = 100.0  # Tuned for stable wrist control
+# wrist_rot_kv = 5.0    # Matched to kp for damping
+# wrist_trans_kp = 100.0  # Conservative to prevent object drops
+# wrist_trans_kv = 5.0   # Damping for translation
 # force_range = 100.0  # Increased from 50 to allow stronger forces
+
+# Stiffer gains for hybrid mode
+finger_kp = 80.0  # Tuned from replay gain sweep (coarse mode optimal)
+finger_kv = finger_kp ** 0.5 / 2  # kv ≈ sqrt(kp)/2 for critical damping
+wrist_rot_kp = 300.0  # Tuned for stable wrist control
+wrist_rot_kv = wrist_rot_kp ** 0.5 / 2    # Matched to kp for damping
+wrist_trans_kp = 300.0  # Conservative to prevent object drops
+wrist_trans_kv = wrist_trans_kp ** 0.5 / 2   # Damping for translation
+force_range = 100.0  # Increased from 50 to allow stronger forces
 
 
 
