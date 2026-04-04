@@ -131,6 +131,20 @@ class Curriculum:
         self.skip_grad = curr_cfg['skip_grad']
         self.zero_epoch = curr_cfg.get('zero_epoch', 50000)
 
+    def _should_zero_all_gains(self, gains):
+        # Only terms that started above zero should be allowed to trigger the
+        # "all gains reached zero" shortcut. This keeps gravity_init=0 from
+        # zeroing unrelated gains like kp on the first decay step.
+        floor_thresholds = {
+            "kp": 0.05,
+            "fr": 0.01,
+            "gravity": 0.01,
+        }
+        for key, threshold in floor_thresholds.items():
+            if key in self.decay_terms and self.init_gains.get(key, 0.0) > 0.0 and gains.get(key, 0.0) < threshold:
+                return True
+        return False
+
     def post_scene_build_setup(self):
         if self.decay_solimp:
             new_params = torch.tensor([self.tconst_upper, 1.0, self.d0_lower, self.dmid_lower, 0.001, 0.5, 2.0]) 
@@ -259,7 +273,7 @@ class Curriculum:
         for k, v in self.curr_gains.items():
             ratio = self.upper_ratios[k]
             new_gains[k] = v * ratio
-        if ("kp" in new_gains and new_gains['kp'] < 0.05) or ("fr" in new_gains and new_gains['fr'] < 0.01) or ("gravity" in new_gains and new_gains['gravity'] < 0.01):
+        if self._should_zero_all_gains(new_gains):
             new_gains = {k: 0.0 for k in new_gains}
         for k in self.decay_terms:
             self.curr_gains[k] = new_gains[k]
@@ -283,7 +297,7 @@ class Curriculum:
         else:
             raise ValueError("Invalid uniform mode") 
             
-        if ('kp' in self.decay_terms and self.curr_gains['kp'] < 0.05) or ('fr' in self.decay_terms and self.curr_gains['fr'] < 0.01) or ('gravity' in self.decay_terms and self.curr_gains['gravity'] < 0.01):
+        if self._should_zero_all_gains(self.curr_gains):
             for k in self.decay_terms:
                 self.curr_gains[k] = 0.0
                 self.curr_gains_lower[k] = 0.0
