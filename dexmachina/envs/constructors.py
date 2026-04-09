@@ -242,6 +242,10 @@ def get_all_env_cfg(args, device, load_retarget_data=True):
             deque_len=args.deque_len,
             decay_solimp=args.decay_solimp,
             solip_multiplier=args.solip_multiplier,
+            d0_lower=args.d0_lower,
+            dmid_lower=args.dmid_lower,
+            tconst_lower=args.tconst_lower,
+            tconst_upper=args.tconst_upper,
             resample_every_epoch=args.resample_every_epoch,
             skip_grad=args.skip_grad,
             zero_epoch=zero_epoch, # set this to last 
@@ -393,6 +397,10 @@ def get_common_argparser():
     parser.add_argument('--deque_len', type=int, default=30)
     parser.add_argument('--decay_solimp', '-ds', action='store_true')
     parser.add_argument('--solip_multiplier', '-solip', type=float, default=0.95)
+    parser.add_argument('--d0_lower', type=float, default=0.9)
+    parser.add_argument('--dmid_lower', type=float, default=0.95)
+    parser.add_argument('--tconst_lower', type=float, default=0.1)
+    parser.add_argument('--tconst_upper', type=float, default=0.15)
     parser.add_argument('--resample_every_epoch', '-resample', type=int, default=-1)
     parser.add_argument('--skip_grad', action='store_true')
 

@@ -1,28 +1,55 @@
 #!/bin/bash
 # Training script for Orca Hand on box manipulation task
+# Usage:
+#   ./examples/train_orca.sh
+#   ./examples/train_orca.sh /path/to/checkpoint.pth
+#   ./examples/train_orca.sh --convexify_object
+#   ./examples/train_orca.sh /path/to/checkpoint.pth --convexify_object
 
 HAND=orca_hand
 CLIP=ketchup-30-130
+CHECKPOINT_PATH=""
+if [[ $# -gt 0 && "$1" != -* ]]; then
+    CHECKPOINT_PATH="$1"
+    shift
+fi
+EXTRA_ARGS=("$@")
 
 # Full run with thumb weighting (5000 epochs) + matched contact normal alignment (kappa=2)
-EXP_NAME=hybrid_start_stable_gravity_comp_vfassistAllLinks_contact_align_k2
-python dexmachina/rl/train_rl_games.py -B 6000 -obf -obt --max_epochs 5000 \
-    --actuate_object --retarget_name para --horizon 16 -imw 0.5 --gain_mode all \
-    --curr_schedule uniform --wait_epochs 100 --learning_rate 0.0003 \
-    --upper_ratios 0.9 0.9 1 0.95 0.95 --lower_ratios 0.8 0.8 1 0.9 0.9 \
-    --save_freq 5000 --group_collisions --fixed_mode uniform --uniform_mode slow \
-    --action_penalty 0.01 --dialback_ep_len 80 --skip_grad --deque_len 30 \
-    --task_rew_betas 10 1 5 --use_retarget_contact \
-    --aux_reset_thres 0 0 0 --curr_rew_thres 0.5 0.01 0.01 0.01 \
-    -am hybrid \
-    -ert 0.4 --contact_beta 10 --contact_align_kappa 2 \
-    --hybrid_scales 0.1 1.0 --kp_init 80 --kv_init 5 \
-    --use_virtual_force_assist --virtual_force_alpha_init 1.0 \
-    --virtual_force_delta 0.001 --virtual_force_kp 40 --virtual_force_kd 4 \
-    --virtual_force_sigma 0.03 --virtual_force_fmax 1.5 \
-    --virtual_force_link_keywords thumb index middle ring pinky\
-    --thumb_weight 4.0 \
-    --clip $CLIP -imi 0.3 -bc 0.3 -con 10 -exp $EXP_NAME --hand $HAND 
+EXP_NAME=hybrid_alltrics_softContactCurriculum_new
+TRAIN_CMD=(
+    python dexmachina/rl/train_rl_games.py
+    -B 6000 -obf -obt --max_epochs 5000
+    --actuate_object --retarget_name para --horizon 16 -imw 0.5 --gain_mode all
+    --curr_schedule uniform --wait_epochs 100 --learning_rate 0.0003
+    --upper_ratios 0.9 0.9 1 0.95 0.95 --lower_ratios 0.8 0.8 1 0.9 0.9
+    --save_freq 5000 --group_collisions --fixed_mode uniform --uniform_mode slow
+    --decay_solimp --tconst_lower 0.1 --tconst_upper 0.15
+    --d0_lower 0.9 --dmid_lower 0.95 --solip_multiplier 0.95
+    --action_penalty 0.01 --dialback_ep_len 80 --skip_grad --deque_len 30
+    --task_rew_betas 10 1 5 --use_retarget_contact
+    --aux_reset_thres 0 0 0 --curr_rew_thres 0.5 0.01 0.01 0.01
+    -am hybrid
+    -ert 0.4 --contact_beta 10
+    --hybrid_scales 0.1 1.0 --kp_init 80 --kv_init 5
+    --use_virtual_force_assist --virtual_force_alpha_init 1.0
+    --virtual_force_delta 0.001 --virtual_force_kp 40 --virtual_force_kd 4
+    --virtual_force_sigma 0.03 --virtual_force_fmax 1.5
+    --virtual_force_link_keywords thumb index middle ring pinky
+    --thumb_weight 4.0
+    --clip "$CLIP" -imi 0.3 -bc 0.3 -con 10 -exp "$EXP_NAME" --hand "$HAND"
+)
+
+if [[ -n "$CHECKPOINT_PATH" ]]; then
+    TRAIN_CMD+=(-ck "$CHECKPOINT_PATH")
+fi
+
+if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
+    TRAIN_CMD+=("${EXTRA_ARGS[@]}")
+fi
+
+"${TRAIN_CMD[@]}"
+    # --contact_align_kappa 2 \
     # --use_latent_world_model --wm_latent_dim 64 
     
 
