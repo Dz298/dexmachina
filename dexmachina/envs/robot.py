@@ -904,14 +904,24 @@ class BaseRobot:
         self.curr_targets[:] = joint_targets
         return  
     
-    def step(self, actions, env_idxs=None, obs=None, base_actions=None):
+    def step(
+        self,
+        actions,
+        env_idxs=None,
+        obs=None,
+        base_actions=None,
+        demo_timestep=None,
+        advance_demo_clock=True,
+    ):
         assert self.initialized, "Robot not initialized"
         if self.action_mode == "policy_residual" and base_actions is not None:
             if env_idxs is None:
                 self.base_actions_buf[:] = base_actions
             else:
                 self.base_actions_buf[env_idxs] = base_actions
-        target_dof_pos = self.translate_actions(actions, self.episode_length_buf, base_policy_actions=base_actions)
+        if demo_timestep is None:
+            demo_timestep = self.episode_length_buf
+        target_dof_pos = self.translate_actions(actions, demo_timestep, base_policy_actions=base_actions)
         if env_idxs is not None:
             target_dof_pos = target_dof_pos[env_idxs]
         
@@ -928,7 +938,8 @@ class BaseRobot:
                 envs_idx=env_idxs
                 ) 
         # NOTE: step the scene in the main thread 
-        self.episode_length_buf += 1    
+        if advance_demo_clock:
+            self.episode_length_buf += 1
         return 
     
     def get_bc_dist(self):

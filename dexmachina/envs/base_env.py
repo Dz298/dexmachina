@@ -7,6 +7,7 @@ from dexmachina.envs.object import ArticulatedObject
 from dexmachina.envs.rewards import RewardModule
 from dexmachina.envs.math_utils import matrix_from_quat
 from dexmachina.envs.contacts import get_filtered_contacts
+from dexmachina.envs.reward_utils import rotation_distance
 from dexmachina.envs.randomizations import RandomizationModule
 from dexmachina.envs.curriculum import Curriculum 
 from dexmachina.envs.maniptrans_curr import ManipTransCurriculum 
@@ -145,6 +146,7 @@ def get_env_cfg(
         'use_rl_games': True,
         "is_eval": False, 
         "rand_init_ratio": 0.0, # randomize initial states  
+        "rand_init_pin_seconds": 0.0,
         "enforce_valid_rand_init_grasp": False,
         "valid_grasp_min_contacts": 1,
         "valid_grasp_contact_thresh": 0.01,
@@ -196,6 +198,7 @@ class BaseEnv:
 
         # Grasp optimization controls must be defined before post_scene_build_setup
         self.rand_init_ratio = env_cfg.get('rand_init_ratio', 0.0)
+        self.rand_init_pin_seconds = float(env_cfg.get('rand_init_pin_seconds', 0.0))
         self.enforce_valid_rand_init_grasp = env_cfg.get('enforce_valid_rand_init_grasp', False)
         self.valid_grasp_min_contacts = env_cfg.get('valid_grasp_min_contacts', 1)
         self.valid_grasp_contact_thresh = env_cfg.get('valid_grasp_contact_thresh', 0.01)
@@ -224,6 +227,9 @@ class BaseEnv:
         self.action_scale = env_cfg['action_scale']
         self.obs_clip = env_cfg['obs_clip']
         self.dt = env_cfg['dt'] 
+        self.rand_init_pin_steps = 0
+        if self.rand_init_pin_seconds > 0.0 and self.dt > 0.0:
+            self.rand_init_pin_steps = max(int(round(self.rand_init_pin_seconds / self.dt)), 0)
         self.early_reset_threshold = env_cfg['early_reset_threshold']
         self.early_reset_interval = int(env_cfg['early_reset_interval']) 
         self.early_reset_aux_thres = env_cfg.get('early_reset_aux_thres', dict())
@@ -557,6 +563,8 @@ class BaseEnv:
         rand_cfg = self.rand_cfg
         self.setup_actions(self.robots) 
         self.observe_tip_dist = env_cfg['observe_tip_dist']
+        if self.rand_init_pin_steps > 0:
+            print(f"Enabling random-init pin stage: {self.rand_init_pin_steps} steps ({self.rand_init_pin_seconds:.3f}s)")
         need_obj_surface_samples = self.observe_tip_dist or self.enforce_valid_rand_init_grasp
         if need_obj_surface_samples:
             assert self.n_objects == 1, "Only support one object for now"
@@ -642,6 +650,9 @@ class BaseEnv:
             self._step_env_idxs = self._step_env_idxs[:-1] # skip the LAST env for eval
         
         self.randomization = RandomizationModule(rand_cfg, self.rigid_solver, self.object, self.num_envs)
+        self._sync_demo_timestep_buffers()
+        self.last_applied_demo_timestep_buf[:] = self.episode_length_buf
+        self.last_applied_object_target_timestep_buf[:] = self._get_object_demo_target_timestep()
         if self.record_video: #  and self.num_envs > 2: 
             # NOTE: set the camera to only record the first env, must do this after the scene.build call
             offset = self.scene.rigid_solver.envs_offset.to_numpy()[0] # (3,)
@@ -734,6 +745,11 @@ class BaseEnv:
         # NOTE this must be int dtype for indexing in match_demo_state
         self.episode_length_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.int32)
         self.episode_start_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.int32) # this should be demo timestep
+        self.rand_init_pin_remaining_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.int32)
+        self.rand_init_pin_frame_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.int32)
+        self.rand_init_pin_active_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        self.last_applied_demo_timestep_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.int32)
+        self.last_applied_object_target_timestep_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.int32)
 
         if self.chunk_ep_length > 0:
             # each env idx has a different init timestep
@@ -763,6 +779,78 @@ class BaseEnv:
             self.latent_buf = torch.zeros((self.num_envs, self.wm_latent_dim), device=self.device)
         
         self.extras = dict() 
+
+    def _get_object_demo_target_timestep(self) -> torch.Tensor:
+        if self.n_objects != 1 or self.object is None or self.object.demo_states is None:
+            return self.episode_length_buf.clone()
+        max_idx = self.object.num_demo_frames - 1
+        target_t = torch.clamp(self.episode_length_buf + 1, max=max_idx)
+        if self.rand_init_pin_active_buf.any():
+            target_t = torch.where(self.rand_init_pin_active_buf, self.rand_init_pin_frame_buf, target_t)
+        return target_t
+
+    def _sync_demo_timestep_buffers(self, env_idxs=None, sync_object_target=True):
+        if env_idxs is None:
+            env_idxs = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
+        elif not isinstance(env_idxs, torch.Tensor):
+            env_idxs = torch.tensor(list(env_idxs), device=self.device, dtype=torch.long)
+        else:
+            env_idxs = env_idxs.to(device=self.device, dtype=torch.long)
+        if env_idxs.numel() == 0:
+            return
+
+        demo_t = self.episode_length_buf[env_idxs]
+        object_target_t = self._get_object_demo_target_timestep()[env_idxs]
+        for robot in self.robots.values():
+            robot.episode_length_buf[env_idxs] = demo_t
+        for obj in self.objects.values():
+            obj.episode_length_buf[env_idxs] = demo_t
+            if sync_object_target and hasattr(obj, "demo_target_timestep_buf"):
+                obj.demo_target_timestep_buf[env_idxs] = object_target_t
+
+    def _advance_demo_timestep_after_step(self):
+        active_mask = self.rand_init_pin_active_buf.clone()
+        if active_mask.any():
+            self.rand_init_pin_remaining_buf[active_mask] -= 1
+            release_mask = active_mask & (self.rand_init_pin_remaining_buf <= 0)
+            self.rand_init_pin_active_buf[release_mask] = False
+            self.rand_init_pin_remaining_buf[release_mask] = 0
+        advance_mask = ~active_mask
+        self.episode_length_buf[advance_mask] += 1
+        self._sync_demo_timestep_buffers(sync_object_target=False)
+
+    def get_rand_init_pin_debug(self, env_idx: int = 0):
+        env_idx = int(env_idx)
+        debug = {
+            "sampled_demo_t": int(self.episode_start_buf[env_idx].item()),
+            "effective_demo_t": int(self.episode_length_buf[env_idx].item()),
+            "pin_frame_t": int(self.rand_init_pin_frame_buf[env_idx].item()),
+            "pin_active": bool(self.rand_init_pin_active_buf[env_idx].item()),
+            "pin_remaining": int(self.rand_init_pin_remaining_buf[env_idx].item()),
+            "pin_steps": int(self.rand_init_pin_steps),
+            "applied_demo_t": int(self.last_applied_demo_timestep_buf[env_idx].item()),
+            "object_demo_target_t": int(self.last_applied_object_target_timestep_buf[env_idx].item()),
+        }
+        if self.n_objects == 1 and self.object is not None and self.object.demo_states is not None:
+            sample_t = debug["pin_frame_t"] if debug["pin_frame_t"] > 0 else debug["sampled_demo_t"]
+            sample_t = int(max(min(sample_t, self.object.num_demo_frames - 1), 0))
+            demo_state = self.object.demo_states[sample_t : sample_t + 1]
+            pos_dist = torch.norm(self.object.root_pos[env_idx : env_idx + 1] - demo_state[:, :3], dim=-1)
+            rot_dist = rotation_distance(self.object.root_quat[env_idx : env_idx + 1], demo_state[:, 3:7])
+            if self.object.demo_dofs is not None:
+                demo_arti_target = self.object.demo_dofs[sample_t : sample_t + 1]
+                if demo_arti_target.shape[-1] != self.object.dof_pos.shape[-1]:
+                    demo_arti_target = demo_arti_target[..., -self.object.dof_pos.shape[-1]:]
+                demo_arti_target = demo_arti_target.flatten()
+            else:
+                demo_arti_target = demo_state[:, 7:8].flatten()
+            arti_dist = torch.abs(self.object.dof_pos[env_idx : env_idx + 1].flatten() - demo_arti_target).max()
+            debug.update(
+                object_pos_dist=float(pos_dist.item()),
+                object_rot_dist=float(rot_dist.item()),
+                object_arti_dist=float(arti_dist.item()),
+            )
+        return debug
     # def progress_episode_length(self):
     #     self.episode_length_buf += 1
     #     for k, robot in self.robots.items():
@@ -798,12 +886,21 @@ class BaseEnv:
         """ call this for only stepping the robot/objects"""
         self.last_actions[:] = self.actions
         self.actions[:] = torch.clamp(actions, -self.action_clip, self.action_clip) * self.action_scale
+        demo_timestep = self.episode_length_buf.clone()
+        object_demo_target_t = self._get_object_demo_target_timestep()
+        self.last_applied_demo_timestep_buf[:] = demo_timestep
+        self.last_applied_object_target_timestep_buf[:] = object_demo_target_t
         
         for k, robot in self.robots.items():
             idxs = self.action_idxs_to_robot[k]
-            robot.step(self.actions[:, idxs], self._step_env_idxs)
+            robot.step(
+                self.actions[:, idxs],
+                self._step_env_idxs,
+                demo_timestep=demo_timestep,
+                advance_demo_clock=False,
+            )
         for k, obj in self.objects.items():
-            obj.step() 
+            obj.step(demo_timestep=object_demo_target_t, advance_demo_clock=False) 
             
     def step(self, actions: torch.Tensor):
         """
@@ -831,17 +928,32 @@ class BaseEnv:
                 break
         
         # Step each robot with appropriate actions
+        demo_timestep = self.episode_length_buf.clone()
+        object_demo_target_t = self._get_object_demo_target_timestep()
+        self.last_applied_demo_timestep_buf[:] = demo_timestep
+        self.last_applied_object_target_timestep_buf[:] = object_demo_target_t
         for k, robot in self.robots.items():
             idxs = self.action_idxs_to_robot[k]
             if robot.action_mode == "policy_residual":
                 # Extract this robot's portion of base policy actions
                 robot_base_actions = base_policy_actions[:, idxs]
-                robot.step(self.actions[:, idxs], self._step_env_idxs, obs=self.obs_buf, 
-                          base_actions=robot_base_actions)
+                robot.step(
+                    self.actions[:, idxs],
+                    self._step_env_idxs,
+                    obs=self.obs_buf,
+                    base_actions=robot_base_actions,
+                    demo_timestep=demo_timestep,
+                    advance_demo_clock=False,
+                )
             else:
-                robot.step(self.actions[:, idxs], self._step_env_idxs)
+                robot.step(
+                    self.actions[:, idxs],
+                    self._step_env_idxs,
+                    demo_timestep=demo_timestep,
+                    advance_demo_clock=False,
+                )
         for k, obj in self.objects.items():
-            obj.step()
+            obj.step(demo_timestep=object_demo_target_t, advance_demo_clock=False)
         # #region agent log
         torch.cuda.synchronize(); _dbg_t1 = _time_mod.perf_counter()
         # #endregion
@@ -866,13 +978,12 @@ class BaseEnv:
         # #endregion
         self.randomization.on_step(self.episode_length_buf)
         self.scene.step()  
-        self.episode_length_buf += 1
+        self._advance_demo_timestep_after_step()
+        # self.progress_episode_length() 
         # #region agent log
         torch.cuda.synchronize(); _dbg_t3 = _time_mod.perf_counter()
         # #endregion
-        # self.progress_episode_length() 
         self._compute_intermediate_values()
-        
         # #region agent log
         torch.cuda.synchronize(); _dbg_t4 = _time_mod.perf_counter()
         # #endregion
@@ -885,6 +996,16 @@ class BaseEnv:
         # #endregion
         if "log" not in self.extras:
             self.extras["log"] = dict() 
+        pin_debug = self.get_rand_init_pin_debug(0)
+        self.extras["log"].update(
+            {
+                "pin_active": float(pin_debug["pin_active"]),
+                "pin_remaining": pin_debug["pin_remaining"],
+                "effective_demo_t": pin_debug["effective_demo_t"],
+                "applied_demo_t": pin_debug["applied_demo_t"],
+                "object_demo_target_t": pin_debug["object_demo_target_t"],
+            }
+        )
 
         # maniptrans curriculum checks additional early resets
         if isinstance(self.curriculum, ManipTransCurriculum) and self.n_objects == 1 and "keypoint_dist" in rew_dict:
@@ -1295,13 +1416,16 @@ class BaseEnv:
         else:
             self.episode_length_buf[env_idxs] = 0
             self.episode_start_buf[env_idxs] = 0 
+        self.rand_init_pin_remaining_buf[env_idxs] = 0
+        self.rand_init_pin_frame_buf[env_idxs] = 0
+        self.rand_init_pin_active_buf[env_idxs] = False
         
         rand_init_mask = None
         if self.rand_init_ratio > 0.0:
             # randomly sample non-zero initial t 
             # num_rand = int(self.rand_init_ratio * len(env_idxs)) + 1
             # treat this as probability 
-            torand = torch.rand(len(env_idxs)) <= self.rand_init_ratio
+            torand = torch.rand(len(env_idxs), device=self.device) <= self.rand_init_ratio
             # randomly sample from any t within max_episode_length
             # end_t = min(self.max_achieved_length + 1, self.max_episode_length - 1)
             end_t = min(100, self.max_episode_length - 1) # TODO: hardcoded for now
@@ -1311,6 +1435,19 @@ class BaseEnv:
             self.episode_length_buf[env_idxs] = ep_starts
             self.episode_start_buf[env_idxs] = ep_starts
             rand_init_mask = torand.clone()
+            if self.rand_init_pin_steps > 0:
+                pin_mask = torand & (ep_starts > 0)
+                self.rand_init_pin_remaining_buf[env_idxs] = torch.where(
+                    pin_mask,
+                    torch.full_like(ep_starts, self.rand_init_pin_steps),
+                    torch.zeros_like(ep_starts),
+                )
+                self.rand_init_pin_frame_buf[env_idxs] = torch.where(
+                    pin_mask,
+                    ep_starts,
+                    torch.zeros_like(ep_starts),
+                )
+                self.rand_init_pin_active_buf[env_idxs] = pin_mask
             
         for k, robot in self.robots.items():
             # need to rand init too
@@ -1321,6 +1458,10 @@ class BaseEnv:
 
         if rand_init_mask is not None:
             self._ensure_valid_rand_init_grasp(env_idxs_list, rand_init_mask)
+
+        self._sync_demo_timestep_buffers(env_idxs)
+        self.last_applied_demo_timestep_buf[env_idxs] = self.episode_length_buf[env_idxs]
+        self.last_applied_object_target_timestep_buf[env_idxs] = self._get_object_demo_target_timestep()[env_idxs]
 
         self.last_actions[env_idxs] = 0.0
         
@@ -1606,12 +1747,18 @@ class BaseEnv:
         env_idx = int(env_idx)
         self.episode_length_buf[env_idx] = 0
         self.episode_start_buf[env_idx] = 0
+        self.rand_init_pin_remaining_buf[env_idx] = 0
+        self.rand_init_pin_frame_buf[env_idx] = 0
+        self.rand_init_pin_active_buf[env_idx] = False
         self.randomization.on_reset_idx([env_idx])
         episode_start = self.episode_start_buf[env_idx:env_idx+1]
         for _, robot in self.robots.items():
             robot.reset_idx(env_idxs=[env_idx], episode_start=episode_start)
         for _, obj in self.objects.items():
             obj.reset_idx(env_idxs=[env_idx], episode_start=episode_start)
+        self._sync_demo_timestep_buffers([env_idx])
+        self.last_applied_demo_timestep_buf[env_idx] = self.episode_length_buf[env_idx]
+        self.last_applied_object_target_timestep_buf[env_idx] = self._get_object_demo_target_timestep()[env_idx]
         if self.use_latent_world_model:
             self.latent_buf[env_idx] = 0.0
          

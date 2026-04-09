@@ -40,6 +40,7 @@ def parse_args():
     parser.add_argument("--hand", type=str, default="orca_hand")
     parser.add_argument("--retarget_name", type=str, default="para")
     parser.add_argument("--rand_init_ratio", type=float, default=1.0)
+    parser.add_argument("--rand_init_pin_seconds", type=float, default=0.0)
     parser.add_argument("--num_resets", type=int, default=20)
     parser.add_argument("--steps_after_reset", type=int, default=50)
     parser.add_argument("--max_reset_attempts", type=int, default=20)
@@ -70,6 +71,9 @@ def parse_args():
     parser.add_argument("--stochastic_policy", action="store_true")
     parser.add_argument("--show_viewer", action="store_true")
     parser.add_argument("--vis_contact", action="store_true")
+    parser.add_argument("--assert_pin_behavior", action="store_true")
+    parser.add_argument("--pin_tolerance", type=float, default=0.05)
+    parser.add_argument("--show_debug_metrics", action="store_true")
     parser.add_argument("--enforce_valid_rand_init_grasp", action="store_true")
     parser.add_argument("--valid_grasp_contact_thresh", type=float, default=0.01)
     parser.add_argument("--valid_grasp_opt_samples", type=int, default=12)
@@ -120,6 +124,7 @@ def build_env(args, saved_env_kwargs=None, saved_robot_cfg=None):
         env_kwargs["env_cfg"]["record_video"] = True
         env_kwargs["env_cfg"]["max_video_frames"] = args.steps_after_reset
         env_kwargs["env_cfg"]["rand_init_ratio"] = args.rand_init_ratio
+        env_kwargs["env_cfg"]["rand_init_pin_seconds"] = args.rand_init_pin_seconds
         env_kwargs["env_cfg"]["render_camera"] = args.render_camera
         env_kwargs["env_cfg"]["early_reset_threshold"] = 0.0
         env_kwargs["env_cfg"]["early_reset_aux_thres"] = dict(con=0.0, imi=0.0, bc=0.0)
@@ -161,6 +166,7 @@ def build_env(args, saved_env_kwargs=None, saved_robot_cfg=None):
     env_cfg["record_video"] = True
     env_cfg["max_video_frames"] = args.steps_after_reset
     env_cfg["rand_init_ratio"] = args.rand_init_ratio
+    env_cfg["rand_init_pin_seconds"] = args.rand_init_pin_seconds
     env_cfg["render_camera"] = args.render_camera
     env_cfg["enforce_valid_rand_init_grasp"] = args.enforce_valid_rand_init_grasp
     env_cfg["valid_grasp_contact_thresh"] = args.valid_grasp_contact_thresh
@@ -265,7 +271,16 @@ def format_action_summary(actions):
     )
 
 
-def annotate_frame(frame, clip_name, reset_idx, step_idx, episode_start, action_summary=None, action_source="zero"):
+def annotate_frame(
+    frame,
+    clip_name,
+    reset_idx,
+    step_idx,
+    episode_start,
+    action_summary=None,
+    action_source="zero",
+    pin_debug=None,
+):
     rgb = np.clip(frame[:, :, :3], 0, 255).astype(np.uint8).copy()
     draw_text(rgb, f"{clip_name}", (18, 28))
     draw_text(rgb, f"reset {reset_idx + 1}  demo_start={episode_start}", (18, 56))
@@ -278,7 +293,104 @@ def annotate_frame(frame, clip_name, reset_idx, step_idx, episode_start, action_
             (18, 140),
         )
         draw_text(rgb, f"a[:6]=[{action_summary['first_dims']}]", (18, 168))
+    if pin_debug is not None:
+        draw_text(
+            rgb,
+            (
+                f"effective_t={pin_debug['effective_demo_t']}  "
+                f"applied_t={pin_debug['applied_demo_t']}  "
+                f"obj_target_t={pin_debug['object_demo_target_t']}"
+            ),
+            (18, 196),
+        )
+        draw_text(
+            rgb,
+            (
+                f"pin_active={int(pin_debug['pin_active'])}  "
+                f"pin_remaining={pin_debug['pin_remaining']}/{pin_debug['pin_steps']}"
+            ),
+            (18, 224),
+        )
+        if "object_pos_dist" in pin_debug:
+            draw_text(
+                rgb,
+                (
+                    f"obj_err pos={pin_debug['object_pos_dist']:.4f}  "
+                    f"rot={pin_debug['object_rot_dist']:.4f}  "
+                    f"arti={pin_debug['object_arti_dist']:.4f}"
+                ),
+                (18, 252),
+            )
     return rgb
+
+
+def assert_pin_trace(reset_debug, step_debugs, args):
+    episode_start = int(reset_debug["sampled_demo_t"])
+    pin_steps = int(reset_debug["pin_steps"])
+    if episode_start <= 0 or pin_steps <= 0:
+        if reset_debug["pin_active"]:
+            raise AssertionError(
+                f"Reset at demo_start={episode_start} should not enter pin stage, but pin_active=True."
+            )
+        return
+
+    if not reset_debug["pin_active"]:
+        raise AssertionError(
+            f"Random reset at demo_start={episode_start} did not enter pin stage."
+        )
+    if len(step_debugs) < pin_steps:
+        raise AssertionError(
+            f"Need at least {pin_steps} recorded steps to validate pin stage, got {len(step_debugs)}."
+        )
+
+    pinned_debugs = step_debugs[:pin_steps]
+    for step_idx, debug in enumerate(pinned_debugs, start=1):
+        if int(debug["applied_demo_t"]) != episode_start:
+            raise AssertionError(
+                f"Pinned step {step_idx} used applied_demo_t={debug['applied_demo_t']} instead of {episode_start}."
+            )
+        if int(debug["object_demo_target_t"]) != episode_start:
+            raise AssertionError(
+                f"Pinned step {step_idx} used object_demo_target_t={debug['object_demo_target_t']} instead of {episode_start}."
+            )
+
+    # Validate the object has settled by the tail of the pin window instead of
+    # requiring perfect tracking from the first pinned step. The object root is
+    # not directly pose-controlled, so an initial transient is expected.
+    tail_len = max(1, pin_steps // 4)
+    tail_debugs = pinned_debugs[-tail_len:]
+    pos_tol = max(args.pin_tolerance, 0.12)
+    rot_tol = max(args.pin_tolerance, 0.05)
+    arti_tol = max(args.pin_tolerance, 0.05)
+    for offset, debug in enumerate(tail_debugs, start=pin_steps - tail_len + 1):
+        pos_err = float(debug.get("object_pos_dist", 0.0))
+        rot_err = float(debug.get("object_rot_dist", 0.0))
+        arti_err = float(debug.get("object_arti_dist", 0.0))
+        if pos_err > pos_tol or rot_err > rot_tol or arti_err > arti_tol:
+            raise AssertionError(
+                f"Pinned tail step {offset} exceeded settled tolerances: "
+                f"pos={pos_err:.4f} > {pos_tol:.4f}, "
+                f"rot={rot_err:.4f} > {rot_tol:.4f}, "
+                f"arti={arti_err:.4f} > {arti_tol:.4f}."
+            )
+
+    if len(step_debugs) <= pin_steps:
+        raise AssertionError(
+            "Need one extra post-pin step to validate the transition without frame skipping."
+        )
+
+    first_post_pin = step_debugs[pin_steps]
+    if int(first_post_pin["applied_demo_t"]) != episode_start:
+        raise AssertionError(
+            f"First post-pin step should resume from sampled frame {episode_start}, "
+            f"got applied_demo_t={first_post_pin['applied_demo_t']}."
+        )
+    expected_object_target = episode_start + 1
+    if int(first_post_pin["object_demo_target_t"]) != expected_object_target:
+        raise AssertionError(
+            f"First post-pin step should advance object target to {expected_object_target}, "
+            f"got {first_post_pin['object_demo_target_t']}."
+        )
 
 
 def build_policy_driver(env, checkpoint):
@@ -307,6 +419,14 @@ def build_policy_driver(env, checkpoint):
 def record_rollouts(env, args, policy_env=None, agent=None):
     if args.rand_init_ratio <= 0.0:
         raise ValueError("rand_init_ratio must be > 0.0 for this script.")
+    if (
+        args.assert_pin_behavior
+        and args.rand_init_pin_seconds > 0.0
+        and args.steps_after_reset <= getattr(env, "rand_init_pin_steps", 0)
+    ):
+        raise ValueError(
+            "steps_after_reset must exceed the pin-step count when --assert_pin_behavior is enabled."
+        )
 
     zero_actions = torch.zeros((env.num_envs, env.action_dim), device=env.device)
     use_policy = agent is not None and policy_env is not None
@@ -325,19 +445,30 @@ def record_rollouts(env, args, policy_env=None, agent=None):
             env.reset()
             obs = None
         episode_start = int(env.episode_start_buf[0].item())
+        reset_debug = env.get_rand_init_pin_debug(0)
         is_random_start = episode_start > 0
         should_record = args.include_nonrandom_resets or is_random_start
         status = "record" if should_record else "skip"
         print(
             f"reset_attempt={attempts} demo_start={episode_start} "
-            f"random_start={is_random_start} action={status}"
+            f"random_start={is_random_start} action={status} "
+            f"pin_active={int(reset_debug['pin_active'])} "
+            f"pin_remaining={reset_debug['pin_remaining']}"
         )
         if not should_record:
             continue
+        if args.assert_pin_behavior:
+            if episode_start > 0 and env.rand_init_pin_steps > 0 and not reset_debug["pin_active"]:
+                raise AssertionError(
+                    f"Expected pin stage for reset at demo_start={episode_start}, but pin_active=False."
+                )
+            if episode_start == 0 and reset_debug["pin_active"]:
+                raise AssertionError("Reset at demo_start=0 should not enter pin stage.")
 
         env.max_video_frames = args.steps_after_reset
         env.start_recording()
         action_summaries = []
+        step_debugs = []
         with torch.inference_mode():
             for _ in range(args.steps_after_reset):
                 if use_policy:
@@ -358,6 +489,23 @@ def record_rollouts(env, args, policy_env=None, agent=None):
                     action_summary = format_action_summary(actions)
                     env.step(actions)
                 action_summaries.append(action_summary)
+                step_debug = env.get_rand_init_pin_debug(0)
+                step_debugs.append(step_debug)
+                if args.show_debug_metrics:
+                    print(
+                        f"reset={accepted_resets + 1} step={len(step_debugs)} "
+                        f"effective_t={step_debug['effective_demo_t']} "
+                        f"applied_t={step_debug['applied_demo_t']} "
+                        f"obj_target_t={step_debug['object_demo_target_t']} "
+                        f"pin_active={int(step_debug['pin_active'])} "
+                        f"pin_remaining={step_debug['pin_remaining']} "
+                        f"obj_err=({step_debug.get('object_pos_dist', 0.0):.4f}, "
+                        f"{step_debug.get('object_rot_dist', 0.0):.4f}, "
+                        f"{step_debug.get('object_arti_dist', 0.0):.4f})"
+                    )
+
+        if args.assert_pin_behavior:
+            assert_pin_trace(reset_debug, step_debugs, args)
 
         segment_frames = env.get_recorded_frames(wait_for_max=False) or []
         if len(segment_frames) == 0:
@@ -373,6 +521,7 @@ def record_rollouts(env, args, policy_env=None, agent=None):
                     episode_start=episode_start,
                     action_summary=action_summaries[min(step_idx, len(action_summaries) - 1)],
                     action_source=("policy" if use_policy else "zero"),
+                    pin_debug=step_debugs[min(step_idx, len(step_debugs) - 1)],
                 )
             )
         accepted_resets += 1

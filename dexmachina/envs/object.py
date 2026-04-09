@@ -362,6 +362,7 @@ class ArticulatedObject:
         
         self.contact_force = torch.zeros((self.num_envs, self.n_links, 3), dtype=torch.float32, device=self.device)
         self.state_diff = torch.zeros((self.num_envs, 8), dtype=torch.float32, device=self.device)
+        self.demo_target_timestep_buf = torch.zeros((self.num_envs,), dtype=torch.int32, device=self.device)
 
     def update_value_buffers(self):
         assert self.initialized, "Object not initialized"
@@ -379,8 +380,7 @@ class ArticulatedObject:
         self.dof_vel[:] = entity.get_dofs_velocity(self.dof_idxs)
         self.contact_force[:] = entity.get_links_net_contact_force()
         if self.demo_states is not None:
-            demo_goal_t = torch.where(
-                self.episode_length_buf >= self.num_demo_frames - 1, self.num_demo_frames - 1, self.episode_length_buf + 1)
+            demo_goal_t = torch.clamp(self.demo_target_timestep_buf, max=self.num_demo_frames - 1)
             self.state_diff[:] = self.demo_states[demo_goal_t] - torch.cat(
                 [self.root_pos, self.root_quat, self.dof_pos], dim=-1)
     
@@ -485,8 +485,10 @@ class ArticulatedObject:
 
         self.contact_force[env_idxs, :] = 0.0
         self.episode_length_buf[env_idxs] = 0
+        self.demo_target_timestep_buf[env_idxs] = 0
         if episode_start is not None:
             self.episode_length_buf[env_idxs] = episode_start
+            self.demo_target_timestep_buf[env_idxs] = episode_start
         self.state_diff[env_idxs, :] = 0.0
 
     def reset(self):
@@ -521,12 +523,21 @@ class ArticulatedObject:
         self.entity.zero_all_dofs_velocity(envs_idx=env_idxs)
         self.update_value_buffers()  
     
-    def step(self, env_idxs=None):
+    def step(self, env_idxs=None, demo_timestep=None, advance_demo_clock=True):
         assert self.initialized, "Object not initialized" 
         assert self.post_built, "Must call post_scene_build_setup before stepping"
-        if self.actuated: 
-            demo_goal_t = torch.where(
-                self.episode_length_buf >= self.num_demo_frames - 1, self.num_demo_frames - 1, self.episode_length_buf + 1) 
+        demo_goal_t = None
+        if self.demo_states is not None:
+            if demo_timestep is None:
+                demo_goal_t = torch.where(
+                    self.episode_length_buf >= self.num_demo_frames - 1,
+                    self.num_demo_frames - 1,
+                    self.episode_length_buf + 1,
+                )
+            else:
+                demo_goal_t = torch.clamp(demo_timestep.to(dtype=torch.int32, device=self.device), max=self.num_demo_frames - 1)
+            self.demo_target_timestep_buf[:] = demo_goal_t
+        if self.actuated and demo_goal_t is not None:
             targets = self.demo_dofs[demo_goal_t]
             self.entity.control_dofs_position(targets)
         if len(self.texture_meshes) > 0:
@@ -544,7 +555,8 @@ class ArticulatedObject:
                     mesh.set_pos(pose[:, :3])
                     mesh.set_quat(pose[:, 3:7]) 
 
-        self.episode_length_buf += 1
+        if advance_demo_clock:
+            self.episode_length_buf += 1
         return 
      
     def flush_episode_data(self):
