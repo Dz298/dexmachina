@@ -45,6 +45,15 @@ def get_reward_cfg(last_n_frame=-1):
         "scale_well_track": 1.0,
         "force_penalty": 0.1,  # ~60 contact pairs in each env
         "action_penalty": 0.0,
+
+        "reach_rew_weight": 0.0,
+        "reach_sigma": 0.2,
+        "grasp_gate_weight": 0.0,
+        "grasp_gate_force_threshold": 1.0,
+        "grasp_gate_min_fingers": 2,
+        "soft_mask_contact": False,
+        "soft_mask_alpha": 1.0,
+
         "objdex_baseline": False,
         "use_retarget_contact": False,
         "retarget_objframe": True, # if True, the contact is in the object frame, otherwise in the wrist frame
@@ -106,6 +115,17 @@ class RewardModule:
             print(f"Using thumb weight: {self.thumb_weight}x")
         self.contact_align_kappa = float(reward_cfg.get("contact_align_kappa", 0.0))
         self._contact_align_enabled = False
+
+        self.reach_rew_weight = reward_cfg.get("reach_rew_weight", 0.0)
+        self.reach_sigma = reward_cfg.get("reach_sigma", 0.2)
+        self.grasp_gate_weight = reward_cfg.get("grasp_gate_weight", 0.0)
+        self.grasp_gate_force_threshold = reward_cfg.get("grasp_gate_force_threshold", 1.0)
+        self.grasp_gate_min_fingers = reward_cfg.get("grasp_gate_min_fingers", 2)
+        self.soft_mask_contact = reward_cfg.get("soft_mask_contact", False)
+        self.soft_mask_alpha = reward_cfg.get("soft_mask_alpha", 1.0)
+        if self.soft_mask_contact:
+            self.mask_zero_contact = False
+
         self.load_demo(demo_data, retarget_data, device)
         if self.contact_align_kappa > 0.0:
             if not self.use_retarget_contact:
@@ -271,6 +291,26 @@ class RewardModule:
         pos_beta = self.cfg["imi_wrist_pos_beta"]
         wrist_rew = (torch.exp(-rot_beta * wrist_rot_dist) + torch.exp(-pos_beta * wrist_pos_dist)) / 2.0 
         return wrist_rew, wrist_pos_dist, wrist_rot_dist
+
+    def compute_reach_reward(self, kpts_left, kpts_right, obj_pos):
+        """Always-on dense reward: fingertip-to-object-center distance."""
+        obj_expanded = obj_pos.unsqueeze(1)  # (B, 1, 3)
+        dist_left = torch.norm(kpts_left - obj_expanded, dim=-1).mean(dim=-1)
+        dist_right = torch.norm(kpts_right - obj_expanded, dim=-1).mean(dim=-1)
+        mean_dist = (dist_left + dist_right) / 2.0
+        reach_rew = self.reach_rew_weight * (1.0 - torch.tanh(mean_dist / self.reach_sigma))
+        return reach_rew, mean_dist
+
+    def compute_grasp_gate(self, contact_forces):
+        """Binary grasp quality: 1 if >= min_fingers robot links have force > threshold."""
+        if contact_forces is None:
+            return None, None
+        force_norm = torch.norm(contact_forces, dim=-1)  # (B, n_obj_parts, n_robot_links)
+        max_force_per_link = force_norm.max(dim=1).values  # (B, n_robot_links)
+        has_contact = max_force_per_link > self.grasp_gate_force_threshold
+        n_contacts = has_contact.sum(dim=-1).float()
+        grasp_gate = (n_contacts >= self.grasp_gate_min_fingers).float()
+        return grasp_gate, n_contacts
 
     def compute_imitation_reward(
         self,
@@ -687,12 +727,27 @@ class RewardModule:
             demo_pos, demo_quat,
             episode_length_buf
         )
+
+        # --- r_reach: always-on dense fingertip-to-object reward ---
+        if self.reach_rew_weight > 0.0 and kpts_left is not None and obj_pos is not None:
+            reach_rew, reach_dist = self.compute_reach_reward(kpts_left, kpts_right, obj_pos)
+            rew += reach_rew
+            rew_dict["reach_rew"] = reach_rew
+            rew_dict["reach_dist"] = reach_dist
+
+        # --- r_grasp_gate: binary grasp quality indicator ---
+        grasp_gate = None
+        if self.grasp_gate_weight > 0.0 and contact_forces is not None:
+            grasp_gate, n_grasp_contacts = self.compute_grasp_gate(contact_forces)
+            rew += self.grasp_gate_weight * grasp_gate
+            rew_dict["grasp_gate"] = grasp_gate
+            rew_dict["n_grasp_contacts"] = n_grasp_contacts
+
         if self.bc_rew_weight > 0.0:
             bc_rew = self.bc_rew_weight * torch.exp(-self.cfg["bc_beta"] * bc_dist)
             bc_rew = torch.mean(bc_rew, dim=-1)
             rew_dict["bc_dist"] = bc_dist.mean(dim=-1)
             rew_dict["bc_rew"] = bc_rew
-            # rew += bc_rew
 
         if self.use_imi_rew: 
             imi_rew, imi_rew_dict = self.compute_imitation_reward(
@@ -700,9 +755,7 @@ class RewardModule:
                 kpts_left, kpts_right, episode_length_buf
             )
             if "well_track" in rew_dict and self.mask_well_track:
-                # use well_track to mask out the imitation reward
                 imi_rew = torch.where(rew_dict["well_track"], torch.zeros_like(imi_rew), imi_rew) 
-            # rew += imi_rew
             rew_dict.update(imi_rew_dict)
  
         if self.contact_rew_weight > 0.0: 
@@ -730,11 +783,18 @@ class RewardModule:
                     episode_length_buf
                 ) 
             if "well_track" in rew_dict and self.mask_well_track:
-                # use well_track to mask out the contact reward
                 contact_rew = torch.where(rew_dict["well_track"], torch.zeros_like(contact_rew), contact_rew)   
-  
-            # rew += contact_rew
+
+            # --- soft mask: smooth contact density instead of hard zero ---
+            if self.soft_mask_contact and contact_forces is not None:
+                cf_norm = torch.norm(contact_forces, dim=-1)  # (B, n_parts, n_links)
+                n_active = (cf_norm > 1.0).flatten(start_dim=1).sum(dim=-1).float()
+                contact_density = 1.0 - torch.exp(-self.soft_mask_alpha * n_active)
+                contact_rew = contact_rew * contact_density
+                rew_dict["contact_density"] = contact_density
+
             rew_dict.update(contact_dict)
+            rew_dict["con_rew"] = contact_rew
         
         if self.multiply_all_rew:
             aux_rew = 1.0
@@ -753,17 +813,14 @@ class RewardModule:
             if self.bc_rew_weight > 0.0:
                 rew += bc_rew
         
-        
-        if self.cfg["force_penalty"] > 0.0 and contact_forces is not None: # shape (B, 2, num_links*2, 3)
-            force_norm = torch.norm(contact_forces, dim=-1).flatten(start_dim=1) # shape (B, 2*num_links*2) -> this goes to up to 5k
+        if self.cfg["force_penalty"] > 0.0 and contact_forces is not None:
+            force_norm = torch.norm(contact_forces, dim=-1).flatten(start_dim=1)
             high_force = torch.where(force_norm > 500.0, force_norm - 500.0, torch.zeros_like(force_norm))
-            high_force = torch.mean(high_force, dim=-1) # shape (B, )
+            high_force = torch.mean(high_force, dim=-1)
             force_penalty = self.cfg["force_penalty"] * high_force 
             rew -= force_penalty
             rew_dict["force_penalty"] = force_penalty
         
-        # rew *= 0.02 
-        # penalize action to stay close to 0 
         if self.cfg["action_penalty"] > 0.0:
             action_penalty = torch.mean(actions**2, dim=-1) * self.cfg["action_penalty"]
             rew -= action_penalty

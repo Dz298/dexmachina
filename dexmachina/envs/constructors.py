@@ -40,6 +40,13 @@ def get_all_env_cfg(args, device, load_retarget_data=True):
     reward_cfg['retarget_objframe'] = not args.retarget_worldfr
     reward_cfg['contact_align_kappa'] = args.contact_align_kappa
     reward_cfg['action_penalty'] = args.action_penalty
+    reward_cfg['reach_rew_weight'] = args.reach_rew_weight
+    reward_cfg['reach_sigma'] = args.reach_sigma
+    reward_cfg['grasp_gate_weight'] = args.grasp_gate_weight
+    reward_cfg['grasp_gate_force_threshold'] = args.grasp_gate_force_threshold
+    reward_cfg['grasp_gate_min_fingers'] = args.grasp_gate_min_fingers
+    reward_cfg['soft_mask_contact'] = args.soft_mask_contact
+    reward_cfg['soft_mask_alpha'] = args.soft_mask_alpha
 
     if args.objdex_baseline:
         print("Setting action mode to hybrid for objdex baseline and task rew beta to lower")
@@ -116,7 +123,8 @@ def get_all_env_cfg(args, device, load_retarget_data=True):
         print(f"Setting traj_lookahead_frames to {args.observe_traj_lookahead}")
     env_cfg['use_contact_reward'] = args.contact_rew_weight > 0
     env_cfg['use_rl_games'] = args.use_rl_games
-    env_cfg['rand_init_ratio'] = args.rand_init_ratio  
+    env_cfg['rand_init_ratio'] = args.rand_init_ratio
+    env_cfg['rand_init_pin_seconds'] = args.rand_init_pin_seconds
     env_cfg['chunk_ep_length'] = args.chunk_ep_length
     env_cfg['use_virtual_force_assist'] = args.use_virtual_force_assist
     env_cfg['virtual_force_cfg'] = dict(
@@ -320,6 +328,13 @@ def get_common_argparser():
     parser.add_argument('--show_fps', '-fps', action='store_true')
     parser.add_argument('--color_object', '-co', default=None, type=str, help='Color of the object to be rendered')
     parser.add_argument('--action_penalty', '-ap', type=float, default=0.0)
+    parser.add_argument('--reach_rew_weight', '-reach', type=float, default=0.0)
+    parser.add_argument('--reach_sigma', type=float, default=0.2)
+    parser.add_argument('--grasp_gate_weight', '-gg', type=float, default=0.0)
+    parser.add_argument('--grasp_gate_force_threshold', '-ggft', type=float, default=1.0)
+    parser.add_argument('--grasp_gate_min_fingers', '-ggmf', type=int, default=2)
+    parser.add_argument('--soft_mask_contact', '-smc', action='store_true')
+    parser.add_argument('--soft_mask_alpha', '-sma', type=float, default=1.0)
     parser.add_argument('--imi_rew_weight', '-imi', type=float, default=0.0)
     parser.add_argument('--imi_wrist_weight', '-imw', type=float, default=0.5) 
     parser.add_argument('--contact_rew_weight', '-con', type=float, default=0.0)
@@ -350,7 +365,8 @@ def get_common_argparser():
     parser.add_argument('--vis_contact', '-vc', action='store_true')
     parser.add_argument('--use_rl_games', '-rlg', action='store_true')
     parser.add_argument('--is_eval', '-eval', action='store_true')
-    parser.add_argument('--rand_init_ratio', '-randr', type=float, default=0.0)   
+    parser.add_argument('--rand_init_ratio', '-randr', type=float, default=0.0)
+    parser.add_argument('--rand_init_pin_seconds', type=float, default=0.0)
     parser.add_argument('--chunk_ep_length', '-chunk', type=int, default=-1)
     
     parser.add_argument('--use_rand', '-rand', action='store_true')

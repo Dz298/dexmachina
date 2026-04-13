@@ -4,8 +4,8 @@
 HAND=orca_hand
 CLIP=ketchup-30-130
 
-# Full run with thumb weighting (5000 epochs) + matched contact normal alignment (kappa=2)
-EXP_NAME=hybrid_start_stable_gravity_comp_vfassistAllLinks_contact_align_k2
+# New reward design: reach + grasp_gate + soft-masked contact + align
+EXP_NAME=hybrid_reach_graspgate_softmask_align
 python dexmachina/rl/train_rl_games.py -B 6000 -obf -obt --max_epochs 5000 \
     --actuate_object --retarget_name para --horizon 16 -imw 0.5 --gain_mode all \
     --curr_schedule uniform --wait_epochs 100 --learning_rate 0.0003 \
@@ -15,15 +15,17 @@ python dexmachina/rl/train_rl_games.py -B 6000 -obf -obt --max_epochs 5000 \
     --task_rew_betas 10 1 5 --use_retarget_contact \
     --aux_reset_thres 0 0 0 --curr_rew_thres 0.5 0.01 0.01 0.01 \
     -am hybrid \
-    -ert 0.4 --contact_beta 10 --contact_align_kappa 2 \
+    -ert 0.4 --contact_beta 10 \
     --hybrid_scales 0.1 1.0 --kp_init 80 --kv_init 5 \
     --use_virtual_force_assist --virtual_force_alpha_init 1.0 \
     --virtual_force_delta 0.001 --virtual_force_kp 40 --virtual_force_kd 4 \
     --virtual_force_sigma 0.03 --virtual_force_fmax 1.5 \
-    --virtual_force_link_keywords thumb index middle ring pinky\
+    --virtual_force_link_keywords thumb index middle ring pinky \
     --thumb_weight 4.0 \
-    --clip $CLIP -imi 0.3 -bc 0.3 -con 10 -exp $EXP_NAME --hand $HAND 
-    # --use_latent_world_model --wm_latent_dim 64 
+    --reach_rew_weight 0.5 --reach_sigma 0.2 \
+    --grasp_gate_weight 0.5 --grasp_gate_force_threshold 1.0 --grasp_gate_min_fingers 2 \
+    --soft_mask_contact --soft_mask_alpha 1.0 \
+    --clip $CLIP -imi 0.3 -bc 0.3 -con 10 -exp $EXP_NAME --hand $HAND
     
 
 
