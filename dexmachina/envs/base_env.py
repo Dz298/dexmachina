@@ -504,8 +504,7 @@ class BaseEnv:
 
         object_link_pos = self.object.entity.get_links_pos()
         object_link_quat = self.object.entity.get_links_quat()
-        total_force_norm = 0.0
-        total_force_count = 0
+        all_force_norms = []
 
         for side, meta in self.virtual_force_meta.items():
             link_pos = self.robots[side].entity.get_links_pos()[:, meta['link_local_idxs'], :]
@@ -537,12 +536,12 @@ class BaseEnv:
                 )
             side_force = self._clip_link_forces(side_force, fmax)
             self.rigid_solver.apply_links_external_force(side_force, meta['link_global_idxs'])
-            total_force_norm += torch.norm(side_force, dim=-1).sum().item()
-            total_force_count += side_force.shape[0] * side_force.shape[1]
+            all_force_norms.append(torch.norm(side_force, dim=-1))
 
         self.extras.setdefault("log", dict())["virtual_force_alpha"] = alpha
-        if total_force_count > 0:
-            self.extras["log"]["virtual_force_mean_norm"] = total_force_norm / total_force_count
+        if all_force_norms:
+            combined = torch.cat([f.flatten() for f in all_force_norms])
+            self.extras["log"]["virtual_force_mean_norm"] = combined.mean()
             
     def build_scene(self):
         env_cfg = self.env_cfg
@@ -815,6 +814,10 @@ class BaseEnv:
         self.last_actions[:] = self.actions
         self.actions[:] = torch.clamp(actions, -self.action_clip, self.action_clip) * self.action_scale
         
+        # #region agent log
+        import time as _time_mod; _dbg_t0 = _time_mod.perf_counter()
+        # #endregion
+        
         # For policy_residual mode, run base policy ONCE for all robots
         base_policy_actions = None
         for k, robot in self.robots.items():
@@ -839,6 +842,9 @@ class BaseEnv:
                 robot.step(self.actions[:, idxs], self._step_env_idxs)
         for k, obj in self.objects.items():
             obj.step()
+        # #region agent log
+        torch.cuda.synchronize(); _dbg_t1 = _time_mod.perf_counter()
+        # #endregion
             
         # Apply object gravity compensation if curriculum is active
         if self.use_curriculum and self.curriculum is not None:
@@ -855,16 +861,28 @@ class BaseEnv:
         elif self.use_virtual_force_assist:
             self._apply_virtual_force_assist(dict(vf=self.virtual_force_cfg.get('alpha_init', 0.0)))
 
+        # #region agent log
+        torch.cuda.synchronize(); _dbg_t2 = _time_mod.perf_counter()
+        # #endregion
         self.randomization.on_step(self.episode_length_buf)
         self.scene.step()  
         self.episode_length_buf += 1
+        # #region agent log
+        torch.cuda.synchronize(); _dbg_t3 = _time_mod.perf_counter()
+        # #endregion
         # self.progress_episode_length() 
         self._compute_intermediate_values()
         
+        # #region agent log
+        torch.cuda.synchronize(); _dbg_t4 = _time_mod.perf_counter()
+        # #endregion
         self.reset_terminated[:], self.reset_time_outs[:] = self._get_dones() 
         self.reset_buf[:] = self.reset_terminated | self.reset_time_outs
  
         rew_dict = self._get_rewards()
+        # #region agent log
+        torch.cuda.synchronize(); _dbg_t5 = _time_mod.perf_counter()
+        # #endregion
         if "log" not in self.extras:
             self.extras["log"] = dict() 
 
@@ -895,16 +913,38 @@ class BaseEnv:
                 )
         # log contact forces
         if self.observe_contact_force:
-            self.extras["log"]["contact_force"] = torch.norm(self.contact_forces, dim=-1).max().item()
+            self.extras["log"]["contact_force"] = torch.norm(self.contact_forces, dim=-1).max()
         
         # get control_force 
         for side in ['left', 'right']:
             robot = self.robots[side]
             control_force = robot.get_control_force()
-            self.extras["log"][f"{side}_control_force"] = control_force.mean().item()
+            self.extras["log"][f"{side}_control_force"] = control_force.mean()
 
         if self.record_video:
             self._render_headless()
+        
+        # #region agent log
+        torch.cuda.synchronize(); _dbg_t6 = _time_mod.perf_counter()
+        if not hasattr(self, '_dbg_step_count'):
+            self._dbg_step_count = 0
+            self._dbg_accum = dict(robot=0.0, vf_gravity=0.0, physics=0.0, intermediate=0.0, rewards=0.0, rest=0.0)
+        self._dbg_accum['robot'] += (_dbg_t1 - _dbg_t0)
+        self._dbg_accum['vf_gravity'] += (_dbg_t2 - _dbg_t1)
+        self._dbg_accum['physics'] += (_dbg_t3 - _dbg_t2)
+        self._dbg_accum['intermediate'] += (_dbg_t4 - _dbg_t3)
+        self._dbg_accum['rewards'] += (_dbg_t5 - _dbg_t4)
+        self._dbg_accum['rest'] += (_dbg_t6 - _dbg_t5)
+        self._dbg_step_count += 1
+        if self._dbg_step_count % 320 == 0:
+            _log_path = '/home/yuxin/Projects/dexmachina/.cursor/debug-9b7d9b.log'
+            import json as _json_mod
+            _payload = {"sessionId":"9b7d9b","location":"base_env.py:step","message":"step_timing","timestamp":int(_time_mod.time()*1000),"hypothesisId":"H1-H4","data":{k: round(v/320*1000, 3) for k, v in self._dbg_accum.items()}}
+            _payload["data"]["total_ms"] = round(sum(self._dbg_accum.values())/320*1000, 3)
+            _payload["data"]["step_count"] = self._dbg_step_count
+            with open(_log_path, 'a') as _f: _f.write(_json_mod.dumps(_payload) + '\n')
+            self._dbg_accum = {k: 0.0 for k in self._dbg_accum}
+        # #endregion
         
         # update obs after potential reset_idx: 
         if self.use_rl_games:
