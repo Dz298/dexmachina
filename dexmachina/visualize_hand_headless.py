@@ -271,24 +271,10 @@ def main(args):
         output_video = os.path.join(args.output_dir, args.output_name)
         os.makedirs(args.output_dir, exist_ok=True)
         print(f"\nCreating video: {output_video}")
-        
-        # Use OpenCV to write video (more reliable than moviepy for headless)
-        height, width = render_frames[0].shape[:2]
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(output_video, fourcc, args.fps, (width, height))
-        
-        for frame in tqdm(render_frames, desc="Writing video"):
-            # Convert RGB to BGR for OpenCV
-            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            out.write(frame_bgr)
-        
-        out.release()
-        
+        from moviepy.editor import ImageSequenceClip
+        clip = ImageSequenceClip(render_frames, fps=args.fps)
+        clip.write_videofile(output_video)
         print(f"✓ Video saved to: {output_video}")
-        print(f"  Duration: {len(render_frames) / args.fps:.2f}s")
-        print(f"  Frames: {len(render_frames)}")
-        print(f"  FPS: {args.fps}")
-        print(f"  Resolution: {width}x{height}")
     
     if args.save_frames:
         print(f"\n✓ Individual frames saved to: {args.output_dir}/")

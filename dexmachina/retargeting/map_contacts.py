@@ -13,7 +13,7 @@ import xml.etree.ElementTree as ET
 from sklearn.neighbors import KDTree 
 from copy import deepcopy
 from collections import defaultdict
-from dexmachina.envs.object import ArticulatedObject, RigidObject, get_arctic_object_cfg, get_ycb_object_cfg
+from dexmachina.envs.object import ArticulatedObject, get_arctic_object_cfg, get_ycb_object_cfg
 from dexmachina.envs.math_utils import matrix_from_quat
 from dexmachina.envs.demo_data import _infer_hand_sides_from_world_coord
 
@@ -330,6 +330,9 @@ def _rpy_to_matrix_np(rpy: np.ndarray) -> np.ndarray:
 
 
 class ArcticObjectMeshHelper:
+    # part_id 1 -> "top", part_id 2 -> "bottom"
+    part_ids = [1, 2]
+
     def __init__(self, object_name: str):
         import trimesh
 
@@ -342,6 +345,13 @@ class ArcticObjectMeshHelper:
         self.joint_origin_rpy = np.zeros(3, dtype=np.float32)
         self.joint_axis = np.array([0.0, 0.0, 1.0], dtype=np.float32)
         self._load_joint_from_urdf(self.cfg["urdf_path"])
+
+    def part_id_to_name(self, part_id: int) -> str:
+        if int(part_id) == 1:
+            return "top"
+        if int(part_id) == 2:
+            return "bottom"
+        raise ValueError(f"Invalid ARCTIC part id: {part_id}")
 
     def _load_joint_from_urdf(self, urdf_path: str):
         root = ET.parse(urdf_path).getroot()
@@ -385,12 +395,36 @@ class ArcticObjectMeshHelper:
         return closest_local.astype(np.float32), normals_local.astype(np.float32)
 
 
-def get_part_name_from_id(part_id: int) -> str:
-    if int(part_id) == 1:
-        return "top"
-    if int(part_id) == 2:
-        return "bottom"
-    raise ValueError(f"Invalid ARCTIC part id: {part_id}")
+class YCBObjectMeshHelper:
+    # YCB is a rigid single-part object; process_dexycb stamps all contacts with part_id=1.
+    part_ids = [1]
+
+    def __init__(self, object_cfg: dict):
+        import trimesh
+
+        mesh_fname = object_cfg["mesh_fname"]
+        assert os.path.exists(mesh_fname), f"YCB mesh not found: {mesh_fname}"
+        self.meshes = {
+            "object": trimesh.load(mesh_fname, force="mesh", process=False),
+        }
+
+    def part_id_to_name(self, part_id: int) -> str:
+        return "object"
+
+    def get_part_pose(self, part: str, root_pos: np.ndarray, root_quat: np.ndarray, joint_qpos: float):
+        root_pos = np.asarray(root_pos, dtype=np.float32)
+        root_rot = _quat_to_matrix_np(np.asarray(root_quat, dtype=np.float32))
+        return root_pos, root_rot
+
+    def query_part_surface_world(self, part: str, points_world: np.ndarray, root_pos: np.ndarray, root_quat: np.ndarray, joint_qpos: float = 0):
+        mesh = self.meshes["object"]
+        part_pos, part_rot = self.get_part_pose(part, root_pos, root_quat, joint_qpos)
+        points_world = np.asarray(points_world, dtype=np.float32)
+        points_local = (points_world - part_pos[None]) @ part_rot
+        closest_local, _, tri_ids = mesh.nearest.on_surface(points_local)
+        normals_local = mesh.face_normals[tri_ids]
+        normals_local = normals_local / np.clip(np.linalg.norm(normals_local, axis=-1, keepdims=True), 1e-8, None)
+        return closest_local.astype(np.float32), normals_local.astype(np.float32)
 
 
 def compute_local_contact_targets(raw_contacts, valids, mesh_helper, obj_state):
@@ -399,11 +433,11 @@ def compute_local_contact_targets(raw_contacts, valids, mesh_helper, obj_state):
     if not np.any(valids):
         return local_positions, local_normals
 
-    for part_id in [1, 2]:
+    for part_id in mesh_helper.part_ids:
         mask = valids & (raw_contacts[:, 3] == part_id)
         if not np.any(mask):
             continue
-        part_name = get_part_name_from_id(part_id)
+        part_name = mesh_helper.part_id_to_name(part_id)
         closest_local, normals_local = mesh_helper.query_part_surface_world(
             part_name,
             raw_contacts[mask, :3],
@@ -531,7 +565,10 @@ if __name__ == "__main__":
         "root_quat": loaded_data["params"]["obj_quat"],
         "joint_qpos": loaded_data["params"]["obj_arti"],
     }
-    mesh_helper = ArcticObjectMeshHelper(object_name)
+    if object_cfg is not None and object_cfg.get("object_type") == "ycb":
+        mesh_helper = YCBObjectMeshHelper(object_cfg)
+    else:
+        mesh_helper = ArcticObjectMeshHelper(object_name)
 
     if args.show_mano_plt:
         contact_links = [world_coord[f"contact_links_{s}"] for s in hand_sides]
@@ -655,7 +692,7 @@ if __name__ == "__main__":
                     link_local_idxs = [link.idx_local for link in links]
                     tosave[side]['collision_link_names'] = link_names
                     tosave[side]['collision_link_local_idxs'] = link_local_idxs
-                    tosave[side]['object_part_names'] = ['top', 'bottom']
+                    tosave[side]['object_part_names'] = obj_part_names
                 
                 if not args.render_only:
                     np.save(save_fname, tosave)

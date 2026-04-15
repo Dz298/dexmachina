@@ -221,11 +221,9 @@ def main(args):
     if args.create_video and render_frames:
         out_path = os.path.join(args.output_dir, args.output_name)
         os.makedirs(args.output_dir, exist_ok=True)
-        h, w = render_frames[0].shape[:2]
-        out = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), args.fps, (w, h))
-        for f in render_frames:
-            out.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
-        out.release()
+        from moviepy.editor import ImageSequenceClip
+        clip = ImageSequenceClip(render_frames, fps=args.fps)
+        clip.write_videofile(out_path)
         print(f"Video: {out_path} ({len(render_frames)} frames @ {args.fps} fps)")
 
 

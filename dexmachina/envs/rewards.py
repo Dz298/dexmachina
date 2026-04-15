@@ -299,9 +299,12 @@ class RewardModule:
     def compute_reach_reward(self, kpts_left, kpts_right, obj_pos):
         """Always-on dense reward: fingertip-to-object-center distance."""
         obj_expanded = obj_pos.unsqueeze(1)  # (B, 1, 3)
-        dist_left = torch.norm(kpts_left - obj_expanded, dim=-1).mean(dim=-1)
-        dist_right = torch.norm(kpts_right - obj_expanded, dim=-1).mean(dim=-1)
-        mean_dist = (dist_left + dist_right) / 2.0
+        dists = []
+        if kpts_left is not None:
+            dists.append(torch.norm(kpts_left - obj_expanded, dim=-1).mean(dim=-1))
+        if kpts_right is not None:
+            dists.append(torch.norm(kpts_right - obj_expanded, dim=-1).mean(dim=-1))
+        mean_dist = torch.stack(dists, dim=0).mean(dim=0)
         reach_rew = self.reach_rew_weight * (1.0 - torch.tanh(mean_dist / self.reach_sigma))
         return reach_rew, mean_dist
 
@@ -746,7 +749,7 @@ class RewardModule:
         )
 
         # --- r_reach: always-on dense fingertip-to-object reward ---
-        if self.reach_rew_weight > 0.0 and kpts_left is not None and obj_pos is not None:
+        if self.reach_rew_weight > 0.0 and (kpts_left is not None or kpts_right is not None) and obj_pos is not None:
             reach_rew, reach_dist = self.compute_reach_reward(kpts_left, kpts_right, obj_pos)
             rew += reach_rew
             rew_dict["reach_rew"] = reach_rew
