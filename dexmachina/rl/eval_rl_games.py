@@ -100,12 +100,17 @@ def eval_one_episode(env, agent, obj_state_tensor, print_rew=False, record_video
                         joint_targets=joints[env_step][None],
                         env_idxs=[ref_env_idx],
                     ) 
+            eval_data["action"].append(actions.detach().cpu().numpy())
             obs, rew, dones, infos = env.step(actions) 
             obj_pos, obj_quat, obj_arti = obj.root_pos, obj.root_quat, obj.dof_pos
             # print(f"Step {env_step}: Obj pos: {obj_pos.cpu().numpy()}")
             obj_state = torch.cat([obj_pos, obj_quat, obj_arti], dim=-1)
             eval_data["obj_state"].append(obj_state.cpu().numpy())
             eval_data["demo_state"].append(demo_state.cpu().numpy())
+            for side in sorted(eval_hands.keys()):
+                eval_data[f"hand_dof_{side}"].append(
+                    eval_hands[side].dof_pos.detach().cpu().numpy()
+                )
 
             rew_dict = uenv.rew_dict
             for key in ['pos_dist', 'rot_dist', 'arti_dist']:
