@@ -18,6 +18,7 @@ from dexmachina.asset_utils import get_rl_config_path
 from dexmachina.envs.base_env import BaseEnv
 from dexmachina.envs.contacts import get_contact_marker_cfgs
 from dexmachina.envs.constructors import get_common_argparser, parse_clip_string  
+from dexmachina.envs.ur5_arm import UR5Arm
 from dexmachina.rl.rl_games_wrapper import RlGamesVecEnvWrapper, RlGamesGpuEnv
 from dexmachina.rl.latent_world_model import load_world_model_for_eval, WorldModelTrainer
 
@@ -47,7 +48,7 @@ def get_eval_hands(uenv):
         raise KeyError("No active hands found in evaluation environment")
     return hands
 
-def eval_one_episode(env, agent, obj_state_tensor, print_rew=False, record_video=False, show_reference=False):
+def eval_one_episode(env, agent, obj_state_tensor, print_rew=False, record_video=False, show_reference=False, ur5_arm=None):
     obs = env.reset() 
     if isinstance(obs, dict):
         obs = obs["obs"]
@@ -101,7 +102,20 @@ def eval_one_episode(env, agent, obj_state_tensor, print_rew=False, record_video
                         env_idxs=[ref_env_idx],
                     ) 
             eval_data["action"].append(actions.detach().cpu().numpy())
-            obs, rew, dones, infos = env.step(actions) 
+            obs, rew, dones, infos = env.step(actions)
+            active_side = next(iter(eval_hands))
+            eval_data["hand_wrist_pose"].append(
+                eval_hands[active_side].wrist_pose.detach().cpu().numpy()
+            )
+            if ur5_arm is not None:
+                ur5_arm.update(eval_hands[active_side].wrist_pose)
+                if ur5_arm.last_ur5_q is not None:
+                    eval_data["ur5_q"].append(ur5_arm.last_ur5_q.copy())
+                if ur5_arm.last_wrist_target is not None:
+                    eval_data["ur5_wrist_target"].append(ur5_arm.last_wrist_target.copy())
+                if ur5_arm.last_ee_fk_pose is not None:
+                    eval_data["ur5_ee_fk_pose"].append(ur5_arm.last_ee_fk_pose.copy())
+                eval_data["ur5_base_pos"].append(ur5_arm._base_pos_np.copy())
             obj_pos, obj_quat, obj_arti = obj.root_pos, obj.root_quat, obj.dof_pos
             # print(f"Step {env_step}: Obj pos: {obj_pos.cpu().numpy()}")
             obj_state = torch.cat([obj_pos, obj_quat, obj_arti], dim=-1)
@@ -143,7 +157,12 @@ def main():
     parser.add_argument('--output_render', '-or', action='store_true') # if not ture, don't show the retargeted reference
     parser.add_argument('--render_dir', '-out', type=str, default="rendered") # if not provided, save in the same folder as the checkpoint
     parser.add_argument('--video_fname', '-of', type=str, default="-eval.mp4") # if not provided, save in the same folder as the checkpoint
-    
+    parser.add_argument('--show_ur5', '-u5', action='store_true',
+                        help='Add a UR5 arm entity that tracks the hand wrist pose via IK')
+    parser.add_argument('--ur5_base_pos', nargs=3, type=float, default=[0.0, 0.0, 0.0],
+                        metavar=('X', 'Y', 'Z'),
+                        help='World-space base position for the UR5 arm (default: 0 0 0)')
+
     args = parser.parse_args()
 
     ckpt_path = "/".join(args.checkpoint.split("/")[:-2])
@@ -232,9 +251,21 @@ def main():
     device = torch.device('cuda:0')
     import genesis as gs
     gs.init(backend=gs.gpu, logging_level='warning')
-    env = BaseEnv(
-         **env_kwargs
-    )
+
+    if args.show_ur5:
+        env = BaseEnv(**env_kwargs, postpone_build=True)
+        ur5_arm = UR5Arm(
+            scene=env.scene,
+            num_envs=env.num_envs,
+            device=device,
+            base_pos=tuple(args.ur5_base_pos),
+        )
+        env.build_scene()
+        env.post_scene_build_setup()
+        ur5_arm.post_scene_build_setup()
+    else:
+        ur5_arm = None
+        env = BaseEnv(**env_kwargs)
     demo_data = env_kwargs['demo_data']
     obj_state_tensor = gather_object_state_tensor(demo_data)
 
@@ -285,7 +316,8 @@ def main():
 
     for eps in range(args.eval_episodes):
         frames, eval_data = eval_one_episode(
-            env, agent, obj_state_tensor, args.print_rew, args.record_video, args.show_reference
+            env, agent, obj_state_tensor, args.print_rew, args.record_video, args.show_reference,
+            ur5_arm=ur5_arm,
             )
         ckpt_eval_fname = os.path.join(ckpt_data_folder, f"eval_ep{eps}.npy")
         np.save(ckpt_eval_fname, eval_data)

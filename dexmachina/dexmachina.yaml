@@ -96,6 +96,10 @@ dependencies:
       - openexr==3.3.3
       - pathtools==0.1.2
       - pin==3.7.0
+      - pin-pink
+      - qpsolvers[daqp]
+      - loop-rate-limiters
+      # numpy must stay <2 for tetgen (genesis dep) compatibility
       - plotly==5.24.1
       - pooch==1.8.2
       - proglog==0.1.12
